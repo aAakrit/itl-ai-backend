@@ -1,0 +1,120 @@
+"""
+High-level AI Service.
+
+Acts as the business layer between FastAPI routes and the AI Gateway.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.services.ai_gateway.gateway import ai_gateway
+
+
+class AIService:
+    """
+    Business service for all AI operations.
+    """
+
+    def __init__(self):
+        self.main = ai_gateway.get_provider("main")
+        self.premium = ai_gateway.get_provider("premium")
+        self.free = ai_gateway.get_provider("free")
+        self.notice = ai_gateway.get_provider("notice")
+        self.summarizer = ai_gateway.get_provider("summarizer")
+
+    # ========================================================================
+    # Main AI
+    # ========================================================================
+
+    async def query(self, payload: dict[str, Any]) -> dict:
+        return await self.main.query(payload)
+
+    async def query_v2(self, payload: dict[str, Any]) -> dict:
+        return await self.main.query_v2(payload)
+
+    async def clarify(self, payload: dict[str, Any]) -> dict:
+        return await self.main.clarify(payload)
+
+    async def refine(self, payload: dict[str, Any]) -> dict:
+        return await self.main.refine(payload)
+
+    async def case_laws(self, payload: dict[str, Any]) -> dict:
+        return await self.main.case_laws(payload)
+
+    async def create_session(self, payload: dict[str, Any]) -> dict:
+        return await self.main.create_session(payload)
+
+    async def feedback(self, payload: dict[str, Any]) -> dict:
+        return await self.main.submit_feedback(payload)
+
+    async def analytics(self, payload: dict[str, Any]) -> dict:
+        return await self.main.analytics(payload)
+
+    # ========================================================================
+    # Premium Judgment AI
+    # ========================================================================
+
+    async def premium_search(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.search(payload)
+
+    async def premium_more(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.more(payload)
+
+    async def premium_clarify(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.clarify(payload)
+
+    async def premium_refine(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.refine(payload)
+
+    async def premium_similar(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.similar(payload)
+
+    async def premium_feedback(self, payload: dict[str, Any]) -> dict:
+        return await self.premium.submit_feedback(payload)
+
+    # ========================================================================
+    # Free Judgment AI
+    # ========================================================================
+
+    async def free_search(self, payload: dict[str, Any]) -> dict:
+        return await self.free.search(payload)
+
+    async def free_more(self, payload: dict[str, Any]) -> dict:
+        return await self.free.more(payload)
+
+    async def free_clarify(self, payload: dict[str, Any]) -> dict:
+        return await self.free.clarify(payload)
+
+    async def free_refine(self, payload: dict[str, Any]) -> dict:
+        return await self.free.refine(payload)
+
+    async def free_similar(self, payload: dict[str, Any]) -> dict:
+        return await self.free.similar(payload)
+
+    # ========================================================================
+    # Notice Reply AI
+    # ========================================================================
+
+    async def generate_notice_reply(
+        self,
+        data: dict[str, Any],
+        files: dict[str, Any],
+    ) -> dict:
+        return await self.notice.generate(data, files)
+
+    # ========================================================================
+    # Document Summarizer
+    # ========================================================================
+
+    async def summarize_document(
+        self,
+        data: dict[str, Any],
+        files: dict[str, Any],
+    ) -> dict:
+        return await self.summarizer.summarize(data, files)
+
+    async def health(self, provider: str):
+        return await ai_gateway.get_provider(provider).health()
+
+ai_service = AIService()

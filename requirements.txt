@@ -12,3 +12,4 @@ python-multipart
 orjson
 brotli-asgi
 alembic>=1.13
+httpx>=0.28.0

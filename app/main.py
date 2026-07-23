@@ -14,6 +14,17 @@ from app.routes.auth import router as auth_router
 from app.routes.cms_page import router as cms_page_router
 from app.routes.admin_user import router as admin_user
 from app.routes.books import router as admin_books
+from app.routes.ai import router as ai_router
+from app.models.ai import (
+    AIConversation,
+    AIProviderSession,
+    AIMessage,
+    AIAttachment,
+    AIFeedback,
+)
+
+# Exception Handlers
+from app.core.exception_handlers import register_exception_handlers
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -23,6 +34,8 @@ app = FastAPI(
     version="1.0.0",
     default_response_class=ORJSONResponse,
 )
+
+register_exception_handlers(app)
 
 # CORS
 app.add_middleware(
@@ -62,3 +75,4 @@ app.include_router(auth_router)
 app.include_router(cms_page_router)
 app.include_router(admin_user)
 app.include_router(admin_books)
+app.include_router(ai_router)
