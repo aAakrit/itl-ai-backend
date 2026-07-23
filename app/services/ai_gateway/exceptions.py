@@ -15,6 +15,14 @@ class AIServiceException(Exception):
         self.message = message
         super().__init__(message)
 
+class AIProviderNotFoundException(AIServiceException):
+    """
+    Raised when an unknown AI provider is requested.
+    """
+
+    def __init__(self, provider: str):
+        self.provider = provider
+        super().__init__(f"AI provider '{provider}' not found.")
 
 class AIConnectionException(AIServiceException):
     """

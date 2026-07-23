@@ -31,11 +31,16 @@ class QueryRequest(SessionRequest):
 
 class AIQueryRequest(QueryRequest):
     """
-    Main AI query request.
+    Main AI chat request.
     """
 
-    deep_research: bool = False
+    conversation_id: int | None = None
 
+    provider: str = "main"
+
+    tool: str = "chat"
+
+    deep_research: bool = False
 
 class ClarifyRequest(SessionRequest):
     """
@@ -131,14 +136,29 @@ class FeedbackRequest(BaseModel):
 # Generic Response
 # =============================================================================
 
+class AIChatResponse(BaseModel):
+
+    conversation_id: int
+
+    user_message_id: int
+
+    assistant_message_id: int
+
+    answer: str
+
+    citations: list[dict] = []
+
+    attachments: list[dict] = []
+
+    metadata: dict[str, Any] = {}
+
+
+
 class AIResponse(BaseModel):
-    """
-    Generic AI response wrapper.
-    """
 
     success: bool = True
 
-    data: dict[str, Any]
+    data: AIChatResponse
 
 
 class ErrorResponse(BaseModel):

@@ -55,10 +55,10 @@ async def query(
 ):
     result = await chat.query(
         user_id=current_user.id,
-        provider="main",
-        tool="chat",
+        provider=request.provider,
+        tool=request.tool,
         query=request.query,
-        conversation_id=getattr(request, "conversation_id", None),
+        conversation_id=request.conversation_id,
         payload=request.dict(),
     )
 
