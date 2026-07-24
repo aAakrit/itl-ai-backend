@@ -262,7 +262,7 @@ class AIMessage(Base):
 
     query = Column(
         Text,
-        nullable=False,
+        nullable=True,
     )
 
     # ------------------------------------------------------------------

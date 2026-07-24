@@ -23,7 +23,7 @@ class CmsPageResponse(CmsPageBase):
     status: str
 
     class Config:
-        from_attributes = True
+        orm_mode  = True
 
 class CmsPageList(BaseModel):
     id: int
@@ -32,4 +32,4 @@ class CmsPageList(BaseModel):
     status: str
 
     class Config:
-        from_attributes = True
+        orm_mode  = True
