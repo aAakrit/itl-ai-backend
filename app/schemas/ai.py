@@ -136,29 +136,15 @@ class FeedbackRequest(BaseModel):
 # Generic Response
 # =============================================================================
 
-class AIChatResponse(BaseModel):
-
-    conversation_id: int
-
-    user_message_id: int
-
-    assistant_message_id: int
-
-    answer: str
-
-    citations: list[dict] = []
-
-    attachments: list[dict] = []
-
-    metadata: dict[str, Any] = {}
-
-
-
 class AIResponse(BaseModel):
-
+    """
+    Generic success envelope. `data` intentionally accepts Any because
+    each AI route (chat, premium search, free search, notice, summarizer,
+    health, ...) returns a different shaped payload, not one fixed schema.
+    """
     success: bool = True
-
-    data: AIChatResponse
+    message: str = "Success"
+    data: Any = None
 
 
 class ErrorResponse(BaseModel):
