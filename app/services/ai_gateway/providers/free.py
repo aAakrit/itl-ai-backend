@@ -24,29 +24,29 @@ class FreeProvider(BaseProvider):
     async def search(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=FreeEndpoints.SEARCH,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def more(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=FreeEndpoints.MORE,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def clarify(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=FreeEndpoints.CLARIFY,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def refine(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=FreeEndpoints.REFINE,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def similar(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=FreeEndpoints.SIMILAR,
-            payload=payload.dict(),
+            payload=payload,
         )

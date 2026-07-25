@@ -24,35 +24,35 @@ class PremiumProvider(BaseProvider):
     async def search(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.SEARCH,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def more(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.MORE,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def clarify(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.CLARIFY,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def refine(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.REFINE,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def similar(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.SIMILAR,
-            payload=payload.dict(),
+            payload=payload,
         )
 
     async def submit_feedback(self, payload: AIQueryRequest) -> dict:
         return await self.post(
             endpoint=PremiumEndpoints.FEEDBACK,
-            payload=payload.dict(),
+            payload=payload,
         )

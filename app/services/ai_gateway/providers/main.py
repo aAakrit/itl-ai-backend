@@ -9,7 +9,6 @@ from typing import Any
 from app.config import AI_MAIN_URL
 from .base import BaseProvider
 from app.services.ai_gateway.endpoints import MainEndpoints
-from app.schemas.ai import AIQueryRequest
 
 class MainProvider(BaseProvider):
     """
@@ -19,7 +18,7 @@ class MainProvider(BaseProvider):
     def __init__(self):
         super().__init__(AI_MAIN_URL)
 
-    async def query(self, payload: AIQueryRequest) -> dict:
+    async def query(self, payload: dict[str, Any]) -> dict:
         """
         Submit a query to the main AI.
         """
@@ -28,65 +27,65 @@ class MainProvider(BaseProvider):
             payload=payload,
         )
 
-    async def query_v2(self, payload: AIQueryRequest) -> dict:
+    async def query_v2(self, payload: dict[str, Any]) -> dict:
         """
         Submit a query using API v2.
         """
         return await self.post(
             endpoint=MainEndpoints.QUERY_V2,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def clarify(self, payload: AIQueryRequest) -> dict:
+    async def clarify(self, payload: dict[str, Any]) -> dict:
         """
         Generate clarification questions.
         """
         return await self.post(
             endpoint=MainEndpoints.CLARIFY,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def refine(self, payload: AIQueryRequest) -> dict:
+    async def refine(self, payload: dict[str, Any]) -> dict:
         """
         Refine an existing answer.
         """
         return await self.post(
             endpoint=MainEndpoints.REFINE,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def case_laws(self, payload: AIQueryRequest) -> dict:
+    async def case_laws(self, payload: dict[str, Any]) -> dict:
         """
         Retrieve related case laws.
         """
         return await self.post(
             endpoint=MainEndpoints.CASE_LAWS,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def create_session(self, payload: AIQueryRequest) -> dict:
+    async def create_session(self, payload: dict[str, Any]) -> dict:
         """
         Create or update an AI session.
         """
         return await self.post(
             endpoint=MainEndpoints.SESSIONS,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def submit_feedback(self, payload: AIQueryRequest) -> dict:
+    async def submit_feedback(self, payload: dict[str, Any]) -> dict:
         """
         Submit user feedback.
         """
         return await self.post(
             endpoint=MainEndpoints.FEEDBACK,
-            payload=payload.dict(),
+            payload=payload,
         )
 
-    async def analytics(self, payload: AIQueryRequest) -> dict:
+    async def analytics(self, payload: dict[str, Any]) -> dict:
         """
         Fetch analytics information.
         """
         return await self.post(
             endpoint=MainEndpoints.ANALYTICS,
-            payload=payload.dict(),
+            payload=payload,
         )

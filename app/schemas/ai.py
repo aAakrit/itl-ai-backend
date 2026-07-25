@@ -40,6 +40,8 @@ class AIQueryRequest(QueryRequest):
 
     tool: str = "chat"
 
+    module_id: str = "gst"
+
     deep_research: bool = False
 
 class ClarifyRequest(SessionRequest):
@@ -140,10 +142,14 @@ class AIResponse(BaseModel):
     """
     Generic success envelope. `data` intentionally accepts Any because
     each AI route (chat, premium search, free search, notice, summarizer,
-    health, ...) returns a different shaped payload, not one fixed schema.
+    health, ...) returns a different shaped payload from the external
+    AI service / ChatService, not a single fixed schema.
     """
+
     success: bool = True
+
     message: str = "Success"
+
     data: Any = None
 
 

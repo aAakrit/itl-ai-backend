@@ -45,6 +45,8 @@ class AIConversation(Base):
     tool = Column(String(50), nullable=True)
     current_provider = Column(String(50), nullable=True)
 
+    module = Column(String(50), nullable=True, index=True)
+
     # Status
     status = Column(String(20), default="ACTIVE", nullable=False)
 
@@ -541,4 +543,3 @@ class AIFeedback(Base):
         "AIMessage",
         back_populates="feedback",
     )
-

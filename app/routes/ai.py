@@ -12,6 +12,7 @@ from fastapi import (
     APIRouter,
     File,
     Form,
+    HTTPException,
     UploadFile,
     status,
 )
@@ -57,6 +58,7 @@ async def query(
         user_id=current_user.id,
         provider=request.provider,
         tool=request.tool,
+        module=request.module_id,
         query=request.query,
         conversation_id=request.conversation_id,
         payload=request.dict(),
@@ -177,6 +179,77 @@ async def analytics(request: AnalyticsRequest):
     return success_response(
         data=result,
         message="Analytics retrieved successfully.",
+    )
+
+# =============================================================================
+# Conversation History
+# =============================================================================
+
+
+@router.get(
+    "/conversations",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List Conversations",
+    description="List the current user's saved AI conversations for a given Module + Tool workspace, most recent first.",
+)
+async def list_conversations(
+    module: str | None = None,
+    tool: str | None = None,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    conversations = chat.list_conversations(current_user.id, module=module, tool=tool)
+
+    return success_response(
+        data=[chat.serialize_conversation(c) for c in conversations],
+        message="Conversations retrieved successfully.",
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get Conversation",
+    description="Retrieve a single conversation together with its full message history.",
+)
+async def get_conversation(
+    conversation_id: int,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    conversation = chat.get_conversation(current_user.id, conversation_id)
+
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return success_response(
+        data=chat.serialize_conversation(conversation, include_messages=True),
+        message="Conversation retrieved successfully.",
+    )
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Delete Conversation",
+    description="Soft-delete a conversation belonging to the current user.",
+)
+async def delete_conversation(
+    conversation_id: int,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    deleted = chat.delete_conversation(current_user.id, conversation_id)
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return success_response(
+        data={"id": conversation_id},
+        message="Conversation deleted successfully.",
     )
 
 # =============================================================================

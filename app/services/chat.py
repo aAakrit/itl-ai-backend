@@ -16,6 +16,21 @@ class ChatService:
         self.db = db
         self.ai_service = ai_service
 
+    @staticmethod
+    def _derive_title(query: str, max_length: int = 60) -> str:
+        """
+        Turns the first user prompt into a short conversation title,
+        the same way ChatGPT/Claude-style products do. Only used when
+        a brand-new conversation is being created.
+        """
+
+        cleaned = " ".join(query.split())
+
+        if len(cleaned) <= max_length:
+            return cleaned or "New Chat"
+
+        return cleaned[: max_length - 1].rstrip() + "…"
+
     # ------------------------------------------------------------------
     # Conversation
     # ------------------------------------------------------------------
@@ -26,6 +41,7 @@ class ChatService:
         conversation_id: Optional[int] = None,
         provider: str = "main",
         tool: str = "chat",
+        module: str = "gst",
         title: Optional[str] = None,
     ) -> AIConversation:
         """
@@ -45,7 +61,7 @@ class ChatService:
                 .first()
             )
 
-            if conversation:
+            if conversation and conversation.module == module and conversation.tool == tool:
                 return conversation
 
         conversation = AIConversation(
@@ -53,6 +69,7 @@ class ChatService:
             title=title or "New Chat",
             provider=provider,
             tool=tool,
+            module=module,
             current_provider=provider,
             status="active",
             is_archived=False,
@@ -207,6 +224,148 @@ class ChatService:
 
         self.db.flush()
 
+    # ------------------------------------------------------------------
+    # Conversation History (list / detail / delete)
+    # ------------------------------------------------------------------
+
+    def list_conversations(
+        self,
+        user_id: int,
+        module: Optional[str] = None,
+        tool: Optional[str] = None,
+    ) -> list[AIConversation]:
+        """
+        Returns non-deleted conversations for a user, most recently active
+        first. When `module`/`tool` are given, only conversations belonging
+        to that exact workspace are returned — each Module+Tool combination
+        must never see another combination's history.
+        """
+
+        filters = [
+            AIConversation.user_id == user_id,
+            AIConversation.deleted_at.is_(None),
+        ]
+
+        if module:
+            filters.append(AIConversation.module == module)
+
+        if tool:
+            filters.append(AIConversation.tool == tool)
+
+        return (
+            self.db.query(AIConversation)
+            .filter(*filters)
+            .order_by(
+                AIConversation.last_message_at.desc(),
+                AIConversation.updated_at.desc(),
+            )
+            .all()
+        )
+
+    def get_conversation(
+        self,
+        user_id: int,
+        conversation_id: int,
+    ) -> Optional[AIConversation]:
+        """
+        Returns a single conversation, scoped to the requesting user.
+        """
+
+        return (
+            self.db.query(AIConversation)
+            .filter(
+                AIConversation.id == conversation_id,
+                AIConversation.user_id == user_id,
+                AIConversation.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+    def get_messages(self, conversation_id: int) -> list[AIMessage]:
+        """
+        Returns every message in a conversation, oldest first.
+        """
+
+        return (
+            self.db.query(AIMessage)
+            .filter(AIMessage.conversation_id == conversation_id)
+            .order_by(AIMessage.created_at.asc())
+            .all()
+        )
+
+    def delete_conversation(self, user_id: int, conversation_id: int) -> bool:
+        """
+        Soft-deletes a conversation. Returns False if it doesn't
+        exist (or doesn't belong to the requesting user).
+        """
+
+        conversation = self.get_conversation(user_id, conversation_id)
+
+        if not conversation:
+            return False
+
+        conversation.deleted_at = datetime.utcnow()
+        conversation.status = "deleted"
+        self.db.commit()
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
+
+    def serialize_message(self, message: AIMessage) -> dict:
+        """
+        Normalizes a stored AIMessage row into a single, frontend-friendly
+        shape regardless of whether it's a user or assistant row.
+        """
+
+        is_user = message.message_type == "user"
+
+        return {
+            "id": message.id,
+            "parent_message_id": message.parent_message_id,
+            "role": "user" if is_user else "assistant",
+            "message_type": message.message_type,
+            "status": message.status,
+            "content": message.query if is_user else message.answer,
+            "confidence": message.confidence,
+            "query_time_ms": message.query_time_ms,
+            "sources": message.sources,
+            "related_judgements": message.related_judgements,
+            "created_at": message.created_at,
+        }
+
+    def serialize_conversation(
+        self,
+        conversation: AIConversation,
+        include_messages: bool = False,
+    ) -> dict:
+        """
+        Normalizes a stored AIConversation row. Messages are only
+        attached when explicitly requested (list views stay light).
+        """
+
+        data = {
+            "id": conversation.id,
+            "title": conversation.title,
+            "provider": conversation.provider,
+            "tool": conversation.tool,
+            "module": conversation.module,
+            "status": conversation.status,
+            "is_archived": conversation.is_archived,
+            "created_at": conversation.created_at,
+            "updated_at": conversation.updated_at,
+            "last_message_at": conversation.last_message_at,
+        }
+
+        if include_messages:
+            data["messages"] = [
+                self.serialize_message(m) for m in self.get_messages(conversation.id)
+            ]
+
+        return data
+
     async def query(
         self,
         *,
@@ -214,6 +373,7 @@ class ChatService:
         query: str,
         provider: str = "main",
         tool: str = "chat",
+        module: str = "gst",
         conversation_id: Optional[int] = None,
         parent_message_id: Optional[int] = None,
         payload: Optional[dict] = None,
@@ -230,6 +390,8 @@ class ChatService:
                 conversation_id=conversation_id,
                 provider=provider,
                 tool=tool,
+                module=module,
+                title=self._derive_title(query),
             )
 
             # ---------------------------------------------------------
