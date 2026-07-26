@@ -25,6 +25,8 @@ from app.schemas.ai import (
     FeedbackRequest,
     JudgmentMoreRequest,
     JudgmentSearchRequest,
+    MessageFeedbackRequest,
+    MessageRefineRequest,
     RefineRequest,
     SessionCreateRequest,
     SimilarRequest,
@@ -94,6 +96,11 @@ async def query_v2(request: AIQueryRequest):
     description="Generate clarification questions for the submitted query.",
 )
 async def clarify(request: ClarifyRequest):
+    # NOT redundant — this is what the frontend's "Clarify Prompt" composer
+    # button actually calls (POST /ai/clarify with just {query}, before the
+    # message has been sent / has a conversation to belong to). Kept as a
+    # standalone, unauthenticated-payload-shape route for that reason; there
+    # is no message-scoped equivalent because there's no message yet.
     result = await ai_service.clarify(request.dict())
 
     return success_response(
@@ -110,6 +117,13 @@ async def clarify(request: ClarifyRequest):
     description="Refine an existing AI response using additional instructions.",
 )
 async def refine(request: RefineRequest):
+    # REDUNDANT: the frontend always calls POST /ai/messages/{message_id}/refine
+    # instead (see message_refine below), which looks up the original
+    # query/answer server-side from the stored message and persists the
+    # refined result as a new conversation message. This standalone route
+    # requires the caller to supply original_query/original_answer directly
+    # and never saves anything — nothing in the app calls it. Kept only for
+    # API completeness / potential external callers; safe to remove if none exist.
     result = await ai_service.refine(request.dict())
 
     return success_response(
@@ -142,6 +156,10 @@ async def case_laws(request: AIQueryRequest):
     description="Submit user feedback for an AI response.",
 )
 async def feedback(request: FeedbackRequest):
+    # REDUNDANT for the same reason as standalone /refine above: the frontend
+    # always calls POST /ai/messages/{message_id}/feedback (see
+    # message_feedback below), which enforces one-submission-per-message and
+    # persists the result. Nothing in the app calls this route.
     result = await ai_service.feedback(request.dict())
 
     return success_response(
@@ -250,6 +268,64 @@ async def delete_conversation(
     return success_response(
         data={"id": conversation_id},
         message="Conversation deleted successfully.",
+    )
+
+
+@router.post(
+    "/messages/{message_id}/feedback",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Message Feedback",
+    description="Submit thumbs up/down on a specific assistant message. One submission per message.",
+)
+async def message_feedback(
+    message_id: int,
+    request: MessageFeedbackRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        message = await chat.submit_feedback(
+            user_id=current_user.id,
+            message_id=message_id,
+            rating=request.rating,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Message not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return success_response(
+        data={"id": message.id, "feedback": message.feedback},
+        message="Feedback submitted successfully.",
+    )
+
+
+@router.post(
+    "/messages/{message_id}/refine",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Refine Message",
+    description="Refine an assistant answer per free-text instruction, appended as a new message in the same conversation.",
+)
+async def message_refine(
+    message_id: int,
+    request: MessageRefineRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        refined = await chat.refine(
+            user_id=current_user.id,
+            message_id=message_id,
+            instruction=request.instruction,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Message not found.")
+
+    return success_response(
+        data=chat.serialize_message(refined),
+        message="Message refined successfully.",
     )
 
 # =============================================================================

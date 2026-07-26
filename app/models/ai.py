@@ -45,6 +45,10 @@ class AIConversation(Base):
     tool = Column(String(50), nullable=True)
     current_provider = Column(String(50), nullable=True)
 
+    # Which Tax Module (e.g. "income-tax", "gst") this conversation belongs to.
+    # Previously absent entirely — the frontend had no way to know which module
+    # a saved conversation was created under, so it silently defaulted every
+    # single one to "income-tax" regardless of what it actually was.
     module = Column(String(50), nullable=True, index=True)
 
     # Status
@@ -293,6 +297,13 @@ class AIMessage(Base):
     web_search_used = Column(
         Boolean,
         default=False,
+    )
+
+    # "up" | "down" | null. Set once, then locked — enforced in the route,
+    # not just the UI, so a replayed request can't submit feedback twice.
+    feedback = Column(
+        String(10),
+        nullable=True,
     )
 
     # ------------------------------------------------------------------

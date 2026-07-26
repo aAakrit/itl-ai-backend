@@ -1,5 +1,5 @@
+import logging
 from datetime import datetime
-from json import tool
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from sqlalchemy.orm import Session
@@ -8,6 +8,8 @@ from app.models.ai import AIConversation, AIMessage
 from app.models.ai import AIProviderSession
 
 from app.services.ai_service import ai_service
+
+logger = logging.getLogger(__name__)
 
 
 class ChatService:
@@ -63,6 +65,10 @@ class ChatService:
 
             if conversation and conversation.module == module and conversation.tool == tool:
                 return conversation
+            # A conversation_id belonging to a different module/tool workspace was
+            # supplied (e.g. a stale id from a previous tool selection) — conversation
+            # identity is (conversation_id + module + tool), so this is treated as
+            # "no conversation" rather than silently continuing the wrong thread.
 
         conversation = AIConversation(
             user_id=user_id,
@@ -157,6 +163,78 @@ class ChatService:
     # Assistant Message
     # ------------------------------------------------------------------
 
+    def _get_last_assistant_answer(self, conversation_id: int) -> Optional[str]:
+        """
+        Most recent assistant answer in a conversation, regardless of which
+        tool produced it. Used as `context_answer` for the Case Law bridge
+        when the conversation already has something to search case law
+        around.
+        """
+
+        last = (
+            self.db.query(AIMessage)
+            .filter(
+                AIMessage.conversation_id == conversation_id,
+                AIMessage.message_type.in_(("assistant", "refinement")),
+                AIMessage.answer.isnot(None),
+            )
+            .order_by(AIMessage.created_at.desc())
+            .first()
+        )
+
+        return last.answer if last else None
+
+    def _normalize_provider_response(self, tool: str, response: dict) -> dict:
+        """
+        Different vendor tools return meaningfully different shapes:
+          - chat / refine-ish tools: {"answer": "...", "sources": [...]}
+          - case-laws bridge: {"results": [...]} — no `answer` field at all.
+        `save_ai_message` (and everything downstream: serialize_message,
+        the frontend) expects a single normalized {"answer", "sources"}
+        shape, so tool-specific responses are mapped to it here rather than
+        leaking vendor-specific shapes into message storage.
+        """
+
+        if tool != "case-laws":
+            return response
+
+        results = response.get("results") or []
+
+        lines = ["**Case Law Research Results**", ""]
+        for r in results:
+            party = r.get("partyname", "Unknown parties")
+            court = r.get("court_name", "")
+            citation = r.get("citation", "")
+            ratio = r.get("ratio") or r.get("held") or r.get("summary") or ""
+            lines.append(f"**{r.get('rank', '')}. {party}** — {court} ({citation})")
+            if ratio:
+                lines.append(f"> {ratio}")
+            lines.append("")
+
+        if not results:
+            lines.append("No matching case law was found for this query.")
+
+        sources = [
+            {
+                "document_type": "judgement",
+                "id": r.get("id"),
+                "reference": r.get("partyname"),
+                "heading": r.get("partyname"),
+                "court_name": r.get("court_name"),
+                "court_area": r.get("court_area"),
+                "citation": r.get("citation"),
+                "similarity": r.get("similarity_score"),
+                "link": r.get("link"),
+            }
+            for r in results
+        ]
+
+        return {
+            **response,
+            "answer": "\n".join(lines),
+            "sources": sources,
+        }
+
     def save_ai_message(
         self,
         conversation_id: int,
@@ -223,6 +301,157 @@ class ChatService:
         conversation.updated_at = datetime.utcnow()
 
         self.db.flush()
+
+    # ------------------------------------------------------------------
+    # Message ownership lookup
+    # ------------------------------------------------------------------
+
+    def get_owned_message(self, user_id: int, message_id: int) -> Optional[AIMessage]:
+        """
+        Returns a message only if it belongs to a conversation owned by
+        the requesting user — the single check every message-scoped
+        action (feedback, refine) must pass before doing anything else.
+        """
+
+        return (
+            self.db.query(AIMessage)
+            .join(AIConversation, AIMessage.conversation_id == AIConversation.id)
+            .filter(
+                AIMessage.id == message_id,
+                AIConversation.user_id == user_id,
+                AIConversation.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+    # ------------------------------------------------------------------
+    # Feedback
+    # ------------------------------------------------------------------
+
+    async def submit_feedback(
+        self,
+        user_id: int,
+        message_id: int,
+        rating: str,
+    ) -> AIMessage:
+        """
+        Records thumbs up/down on an assistant message, forwarding it to
+        the vendor's feedback API. Enforced as one submission per message —
+        a second attempt raises, it does not silently overwrite the first.
+        """
+
+        if rating not in ("up", "down"):
+            raise ValueError('rating must be "up" or "down"')
+
+        message = self.get_owned_message(user_id, message_id)
+
+        if not message or message.message_type != "assistant":
+            raise LookupError("Message not found.")
+
+        if message.feedback:
+            raise ValueError("Feedback has already been submitted for this message.")
+
+        # The vendor's real feedback contract (api_io_reference.md) is
+        # POST /api/v2/feedback: {message_id, rating: "up"|"down", ...} —
+        # but `message_id` there means the VENDOR's own message id, which is
+        # only ever returned by v2 /query (session-token based) and the
+        # judgement-bot /search endpoints. We currently call v1 /query, whose
+        # documented response has no message_id at all. There is no vendor id
+        # to correctly send here, so rather than guessing (e.g. sending our
+        # own internal id, which the vendor's DB has never heard of) the
+        # vendor call is skipped and feedback is recorded locally only.
+        # TODO: once conversation flow migrates to v2 (/api/v2/sessions +
+        # /api/v2/query), `message.provider_message_id` will hold the real
+        # vendor id and this can call POST /api/v2/feedback for real.
+        if message.provider_message_id:
+            try:
+                await self.ai_service.feedback(
+                    {
+                        "message_id": message.provider_message_id,
+                        "rating": rating,
+                    }
+                )
+            except Exception:
+                # Local feedback recording must still succeed even if the
+                # vendor call fails — don't lose the user's feedback over it.
+                logger.warning("Vendor feedback submission failed for message %s", message_id, exc_info=True)
+
+        message.feedback = rating
+        self.db.commit()
+
+        return message
+
+    # ------------------------------------------------------------------
+    # Refine
+    # ------------------------------------------------------------------
+
+    async def refine(
+        self,
+        user_id: int,
+        message_id: int,
+        instruction: str,
+    ) -> AIMessage:
+        """
+        Refines an existing assistant answer per free-text instruction
+        ("make it more formal", "add more case law", ...) and appends the
+        result as a NEW assistant message in the same conversation — the
+        original answer is never overwritten.
+        """
+
+        message = self.get_owned_message(user_id, message_id)
+
+        if not message or message.message_type != "assistant":
+            raise LookupError("Message not found.")
+
+        conversation = (
+            self.db.query(AIConversation)
+            .filter(AIConversation.id == message.conversation_id)
+            .first()
+        )
+
+        provider_session = self.get_or_create_provider_session(
+            conversation_id=conversation.id,
+            provider=message.provider,
+        )
+
+        # The original user query this answer was responding to — refine
+        # needs it for context alongside the answer being refined.
+        parent_query = (
+            self.db.query(AIMessage)
+            .filter(AIMessage.id == message.parent_message_id)
+            .first()
+        )
+
+        response = await self.call_provider(
+            provider=message.provider,
+            tool="refine",
+            payload={
+                "original_query": parent_query.query if parent_query else "",
+                "original_answer": message.answer or "",
+                "refinement_instructions": instruction,
+                "message_id": message.provider_message_id,
+            },
+        )
+
+        self.save_provider_session_token(provider_session=provider_session, response=response)
+
+        # Vendor's /refine response key is `refined_answer`, not `answer`.
+        normalized_response = {**response, "answer": response.get("refined_answer") or response.get("answer")}
+
+        refined_message = self.save_ai_message(
+            conversation_id=conversation.id,
+            provider=message.provider,
+            response=normalized_response,
+            # Chained off the ORIGINAL answer (not its parent question) so the
+            # message tree reflects "this is a refinement of that answer".
+            parent_message_id=message.id,
+        )
+        refined_message.message_type = "refinement"
+
+        self.update_conversation(conversation=conversation, provider=message.provider)
+        self.db.commit()
+
+        return refined_message
 
     # ------------------------------------------------------------------
     # Conversation History (list / detail / delete)
@@ -333,6 +562,7 @@ class ChatService:
             "query_time_ms": message.query_time_ms,
             "sources": message.sources,
             "related_judgements": message.related_judgements,
+            "feedback": message.feedback,
             "created_at": message.created_at,
         }
 
@@ -415,11 +645,39 @@ class ChatService:
             # ---------------------------------------------------------
             # Provider Payload
             # ---------------------------------------------------------
-            provider_payload = {
-                **payload,
-                "query": query,
-                "session_id": provider_session.provider_session_token,
-            }
+            # Built per-tool against the vendor's *documented* contract,
+            # rather than blindly forwarding our own internal request dict
+            # (which includes fields like conversation_id/provider/module_id
+            # the vendor never asked for and doesn't document).
+            #
+            # IMPORTANT: v1 /query's documented input is `{query, max_results}`
+            # ONLY — it has no session_id field at all. True multi-turn memory
+            # on the vendor's side requires migrating to v2 (/api/v2/sessions +
+            # /api/v2/query with session_token), which is a separate, larger
+            # change. Until then, conversation continuity is provided entirely
+            # by our own stored history (the UI shows the full thread) — each
+            # individual vendor call is stateless from the vendor's point of view.
+            max_results = payload.get("max_results", 5)
+
+            if tool == "case-laws":
+                # /api/v1/case-laws requires `context_answer` — a prior answer
+                # to search supporting case law around. This was previously
+                # missing entirely, which is why case-law calls were failing.
+                # It's not a standalone conversational endpoint: use the most
+                # recent assistant answer in this conversation as context, or
+                # fall back to the query itself if there isn't one yet (e.g.
+                # Case Law is the very first message in a new conversation).
+                context_answer = self._get_last_assistant_answer(conversation.id) or query
+                provider_payload = {
+                    "query": query,
+                    "context_answer": context_answer,
+                    "max_results": min(max_results, 10),
+                }
+            else:
+                provider_payload = {
+                    "query": query,
+                    "max_results": max_results,
+                }
 
             # ---------------------------------------------------------
             # Call AI Provider
@@ -444,7 +702,7 @@ class ChatService:
             assistant_message = self.save_ai_message(
                 conversation_id=conversation.id,
                 provider=provider,
-                response=response,
+                response=self._normalize_provider_response(tool, response),
                 parent_message_id=user_message.id,
             )
 
