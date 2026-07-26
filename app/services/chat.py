@@ -365,12 +365,19 @@ class ChatService:
         # vendor id and this can call POST /api/v2/feedback for real.
         if message.provider_message_id:
             try:
-                await self.ai_service.feedback(
-                    {
-                        "message_id": message.provider_message_id,
-                        "rating": rating,
-                    }
-                )
+                feedback_payload = {
+                    "message_id": message.provider_message_id,
+                    "rating": rating,
+                }
+                # Route to the SAME provider that answered — Case Law Research
+                # (premium) messages must go to /api/judgements/premium/feedback/,
+                # not the main bot's /api/v2/feedback. This was previously
+                # always calling ai_service.feedback() (main only) regardless
+                # of message.provider.
+                if message.provider == "premium":
+                    await self.ai_service.premium_feedback(feedback_payload)
+                else:
+                    await self.ai_service.feedback(feedback_payload)
             except Exception:
                 # Local feedback recording must still succeed even if the
                 # vendor call fails — don't lose the user's feedback over it.
@@ -430,6 +437,7 @@ class ChatService:
                 "original_answer": message.answer or "",
                 "refinement_instructions": instruction,
                 "message_id": message.provider_message_id,
+                "session_id": conversation.id,
             },
         )
 
@@ -462,12 +470,14 @@ class ChatService:
         user_id: int,
         module: Optional[str] = None,
         tool: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> list[AIConversation]:
         """
         Returns non-deleted conversations for a user, most recently active
-        first. When `module`/`tool` are given, only conversations belonging
-        to that exact workspace are returned — each Module+Tool combination
-        must never see another combination's history.
+        first. When `module`/`tool`/`provider` are given, only conversations
+        belonging to that exact workspace are returned — each
+        Module+Provider+Tool combination must never see another
+        combination's history.
         """
 
         filters = [
@@ -480,6 +490,9 @@ class ChatService:
 
         if tool:
             filters.append(AIConversation.tool == tool)
+
+        if provider:
+            filters.append(AIConversation.provider == provider)
 
         return (
             self.db.query(AIConversation)
@@ -645,38 +658,36 @@ class ChatService:
             # ---------------------------------------------------------
             # Provider Payload
             # ---------------------------------------------------------
-            # Built per-tool against the vendor's *documented* contract,
-            # rather than blindly forwarding our own internal request dict
-            # (which includes fields like conversation_id/provider/module_id
-            # the vendor never asked for and doesn't document).
-            #
-            # IMPORTANT: v1 /query's documented input is `{query, max_results}`
-            # ONLY — it has no session_id field at all. True multi-turn memory
-            # on the vendor's side requires migrating to v2 (/api/v2/sessions +
-            # /api/v2/query with session_token), which is a separate, larger
-            # change. Until then, conversation continuity is provided entirely
-            # by our own stored history (the UI shows the full thread) — each
-            # individual vendor call is stateless from the vendor's point of view.
+            # Built per-tool against the vendor's confirmed contract — see
+            # core/views.py + core/case_law_research_views.py in the vendor's
+            # own Django reference client, which is authoritative over the
+            # markdown API doc (which turned out to omit/misdescribe several
+            # fields, including session_id — the reference client sends it
+            # on every single call, main and premium alike).
             max_results = payload.get("max_results", 5)
 
             if tool == "case-laws":
-                # /api/v1/case-laws requires `context_answer` — a prior answer
-                # to search supporting case law around. This was previously
-                # missing entirely, which is why case-law calls were failing.
-                # It's not a standalone conversational endpoint: use the most
-                # recent assistant answer in this conversation as context, or
-                # fall back to the query itself if there isn't one yet (e.g.
-                # Case Law is the very first message in a new conversation).
+                # MainProvider's /api/v1/case-laws — the "similar case law to
+                # an existing answer" flow. Requires context_answer. NOT what
+                # the "Case Law Research" tool calls (that's provider=premium,
+                # tool=search, below) — kept for a possible future "find
+                # similar case law" action on an existing answer.
                 context_answer = self._get_last_assistant_answer(conversation.id) or query
                 provider_payload = {
                     "query": query,
                     "context_answer": context_answer,
                     "max_results": min(max_results, 10),
+                    "session_id": conversation.id,
+                    "message_id": user_message.id,
                 }
             else:
+                # main/chat, premium/search, premium/clarify, premium/refine —
+                # all confirmed to share this same base shape plus session_id.
                 provider_payload = {
                     "query": query,
                     "max_results": max_results,
+                    "session_id": conversation.id,
+                    "message_id": user_message.id,
                 }
 
             # ---------------------------------------------------------
@@ -802,5 +813,16 @@ class ChatService:
 
             if tool == "case-laws":
                 return await self.ai_service.case_laws(payload)
+
+        if provider == "premium":
+
+            if tool == "search":
+                return await self.ai_service.premium_search(payload)
+
+            if tool == "clarify":
+                return await self.ai_service.premium_clarify(payload)
+
+            if tool == "refine":
+                return await self.ai_service.premium_refine(payload)
 
         raise ValueError(f"Unsupported provider/tool: {provider}/{tool}")

@@ -101,7 +101,14 @@ async def clarify(request: ClarifyRequest):
     # message has been sent / has a conversation to belong to). Kept as a
     # standalone, unauthenticated-payload-shape route for that reason; there
     # is no message-scoped equivalent because there's no message yet.
-    result = await ai_service.clarify(request.dict())
+    #
+    # Provider-routed: was previously always calling main's /api/v1/clarify
+    # even when the active tool was Case Law Research, which needs
+    # /api/judgements/premium/clarify/ instead.
+    if request.provider == "premium":
+        result = await ai_service.premium_clarify(request.dict(exclude={"provider"}))
+    else:
+        result = await ai_service.clarify(request.dict(exclude={"provider"}))
 
     return success_response(
         data=result,
@@ -214,10 +221,11 @@ async def analytics(request: AnalyticsRequest):
 async def list_conversations(
     module: str | None = None,
     tool: str | None = None,
+    provider: str | None = None,
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
-    conversations = chat.list_conversations(current_user.id, module=module, tool=tool)
+    conversations = chat.list_conversations(current_user.id, module=module, tool=tool, provider=provider)
 
     return success_response(
         data=[chat.serialize_conversation(c) for c in conversations],

@@ -21,36 +21,36 @@ class MainEndpoints:
 
 
 class PremiumEndpoints:
-    SEARCH = "/api/v1/search"
-    MORE = "/api/v1/more"
+    SEARCH = "/api/judgements/premium/search"
+    MORE = "/api/judgements/premium/more"
 
-    CLARIFY = "/api/v1/clarify"
-    REFINE = "/api/v1/refine"
-    SIMILAR = "/api/v1/similar"
+    CLARIFY = "/api/judgements/premium/clarify"
+    REFINE = "/api/judgements/premium/refine"
+    SIMILAR = "/api/judgements/premium/similar"
 
-    FEEDBACK = "/api/v1/feedback"
+    FEEDBACK = "/api/judgements/premium/feedback"
 
     HEALTH = "/api/health"
 
 
 class FreeEndpoints:
-    SEARCH = "/api/v1/search"
-    MORE = "/api/v1/more"
+    SEARCH = "/api/judgements/free/search"
+    MORE = "/api/judgements/free/more"
 
-    CLARIFY = "/api/v1/clarify"
-    REFINE = "/api/v1/refine"
-    SIMILAR = "/api/v1/similar"
+    CLARIFY = "/api/judgements/free/clarify"
+    REFINE = "/api/judgements/free/refine"
+    SIMILAR = "/api/judgements/free/similar"
 
     HEALTH = "/api/health"
 
 
 class NoticeEndpoints:
-    GENERATE = "/api/v1/generate"
+    GENERATE = "/process_notice"
 
     HEALTH = "/api/health"
 
 
 class SummarizerEndpoints:
-    SUMMARIZE = "/api/v1/summarize"
+    SUMMARIZE = "/summarize"
 
     HEALTH = "/api/health"

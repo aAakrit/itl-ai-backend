@@ -57,6 +57,12 @@ class ClarifyRequest(BaseModel):
 
     query: str = Field(..., min_length=1, max_length=5000)
 
+    # Which bot to clarify against — "main" (Ask Bot, /api/v1/clarify) or
+    # "premium" (Case Law Research, /api/judgements/premium/clarify/).
+    # This fires before a message/conversation exists, so the frontend
+    # must tell us which tool's Clarify button was clicked.
+    provider: str = "main"
+
 
 class RefineRequest(BaseModel):
     """
