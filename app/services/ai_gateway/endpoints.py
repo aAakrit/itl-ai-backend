@@ -17,6 +17,8 @@ class MainEndpoints:
     SESSIONS = "/api/v2/sessions"
     FEEDBACK = "/api/v2/feedback"
 
+    ANALYTICS = "/api/v2/analytics/summary"
+
     HEALTH = "/api/health"
 
 
@@ -45,12 +47,16 @@ class FreeEndpoints:
 
 
 class NoticeEndpoints:
-    GENERATE = "/api/notice/process/"
+    PROCESS_TEXT = "/api/notice/process"
+
+    PROCESS_FILE = "/api/notice/process-file"
 
     HEALTH = "/api/health"
 
 
 class SummarizerEndpoints:
-    SUMMARIZE = "/api/summarize/text/"
+    SUMMARIZE_TEXT = "/api/summarize/text"
+    
+    SUMMARIZE_FILE = "/api/summarize/file"
 
     HEALTH = "/api/health"

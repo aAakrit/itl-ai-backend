@@ -48,8 +48,8 @@ class AIService:
     async def feedback(self, payload: dict[str, Any]) -> dict:
         return await self.main.submit_feedback(payload)
 
-    async def analytics(self, payload: dict[str, Any]) -> dict:
-        return await self.main.analytics(payload)
+    async def analytics(self, params: dict[str, Any] | None = None) -> dict:
+        return await self.main.analytics(params)
 
     # ========================================================================
     # Premium Judgment AI
@@ -99,9 +99,14 @@ class AIService:
     async def generate_notice_reply(
         self,
         data: dict[str, Any],
-        files: dict[str, Any],
+        files: dict[str, Any] | None = None,
     ) -> dict:
-        return await self.notice.generate(data, files)
+        if files:
+            return await self.notice.generate_from_file(data, files)
+        return await self.notice.generate_from_text(data)
+
+    async def get_notice_types(self) -> dict:
+        return await self.notice.get_notice_types()
 
     # ========================================================================
     # Document Summarizer
@@ -110,9 +115,11 @@ class AIService:
     async def summarize_document(
         self,
         data: dict[str, Any],
-        files: dict[str, Any],
+        files: dict[str, Any] | None = None,
     ) -> dict:
-        return await self.summarizer.summarize(data, files)
+        if files:
+            return await self.summarizer.summarize_file(data, files)
+        return await self.summarizer.summarize_text(data)
 
     async def health(self, provider: str):
         return await ai_gateway.get_provider(provider).health()

@@ -8,6 +8,7 @@ from app.models.ai import AIConversation, AIMessage
 from app.models.ai import AIProviderSession
 
 from app.services.ai_service import ai_service
+from app.utils import storage
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ class ChatService:
     # Provider Session
     # ------------------------------------------------------------------
 
-    def get_or_create_provider_session(
+    async def get_or_create_provider_session(
         self,
         conversation_id: int,
         provider: str,
@@ -100,6 +101,24 @@ class ChatService:
         """
         Returns an active provider session for the conversation.
         Creates one if it doesn't exist.
+
+        For `provider == "main"`, creation calls the vendor's own
+        POST /api/v2/sessions to mint a real session_token, which every
+        subsequent Ask Bot / Clarify / Refine call for this conversation
+        then reuses — this is what actually gives the vendor bot multi-turn
+        memory. Previously nothing ever called this endpoint; a locally
+        generated conversation id was sent as if it were a session
+        identifier, which the vendor's session lifecycle doesn't recognize.
+
+        Case Law Research (premium/judgement service) and Notice Reply /
+        Summarizer are separate vendor services with no documented
+        session-creation endpoint of their own (confirmed against both the
+        vendor API doc and the Django reference client — neither shows a
+        premium/notice/summarizer equivalent of /api/v2/sessions). For
+        those, `provider_session_token` stays unset and their own
+        documented `session_id` field (this conversation's id) is used
+        instead, matching their actual confirmed contracts rather than
+        inventing a session mechanism that isn't documented for them.
         """
 
         session = (
@@ -115,11 +134,40 @@ class ChatService:
         if session:
             return session
 
+        token = None
+        metadata: dict = {}
+
+        if provider == "main":
+            try:
+                # Vendor request contract for POST /api/v2/sessions isn't
+                # fully specified in any doc shared so far (only that it
+                # exists and is called "on New Chat") — sending an empty
+                # body is the safest assumption for a bare "create a
+                # session" action. Response shape is defensively probed
+                # for common token field names.
+                response = await self.ai_service.create_session({})
+                token = (
+                    response.get("session_token")
+                    or response.get("token")
+                    or response.get("session_id")
+                )
+                metadata = response if isinstance(response, dict) else {}
+            except Exception:
+                # Don't block the conversation from being created just
+                # because session provisioning failed — fall back to no
+                # token (the query call below still works, just without
+                # vendor-side memory for this turn).
+                logger.warning(
+                    "Vendor session creation failed for conversation %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+
         session = AIProviderSession(
             conversation_id=conversation_id,
             provider=provider,
-            provider_session_token=None,
-            provider_metadata={},
+            provider_session_token=token,
+            provider_metadata=metadata,
             status="active",
         )
 
@@ -139,11 +187,15 @@ class ChatService:
         provider: str,
         query: str,
         parent_message_id: Optional[int] = None,
+        attachment: Optional[dict] = None,
     ) -> AIMessage:
         """
         Persist the user's prompt before sending it
-        to the external AI provider.
+        to the external AI provider. `attachment`, if given, is
+        {filename, content_type, size, path} from app.utils.storage.
         """
+
+        attachment = attachment or {}
 
         message = AIMessage(
             conversation_id=conversation_id,
@@ -152,6 +204,10 @@ class ChatService:
             message_type="user",
             status="pending",
             query=query,
+            attachment_filename=attachment.get("filename"),
+            attachment_content_type=attachment.get("content_type"),
+            attachment_size=attachment.get("size"),
+            attachment_path=attachment.get("path"),
         )
 
         self.db.add(message)
@@ -434,7 +490,7 @@ class ChatService:
             .first()
         )
 
-        provider_session = self.get_or_create_provider_session(
+        provider_session = await self.get_or_create_provider_session(
             conversation_id=conversation.id,
             provider=message.provider,
         )
@@ -456,6 +512,7 @@ class ChatService:
                 "refinement_instructions": instruction,
                 "message_id": message.provider_message_id,
                 "session_id": conversation.id,
+                **({"session_token": provider_session.provider_session_token} if provider_session.provider_session_token else {}),
             },
         )
 
@@ -582,6 +639,17 @@ class ChatService:
 
         is_user = message.message_type == "user"
 
+        attachment = None
+        if message.attachment_path:
+            attachment = {
+                "filename": message.attachment_filename,
+                "content_type": message.attachment_content_type,
+                "size": message.attachment_size,
+                # Frontend downloads through this authenticated route —
+                # never serves attachment_path (the on-disk storage name) directly.
+                "download_url": f"/ai/messages/{message.id}/attachment",
+            }
+
         return {
             "id": message.id,
             "parent_message_id": message.parent_message_id,
@@ -594,6 +662,7 @@ class ChatService:
             "sources": message.sources,
             "related_judgements": message.related_judgements,
             "feedback": message.feedback,
+            "attachment": attachment,
             "created_at": message.created_at,
         }
 
@@ -658,7 +727,7 @@ class ChatService:
             # ---------------------------------------------------------
             # Provider Session
             # ---------------------------------------------------------
-            provider_session = self.get_or_create_provider_session(
+            provider_session = await self.get_or_create_provider_session(
                 conversation_id=conversation.id,
                 provider=provider,
             )
@@ -676,10 +745,20 @@ class ChatService:
             # ---------------------------------------------------------
             # Provider Payload
             # ---------------------------------------------------------
+            # Built per-tool against the vendor's confirmed contract — see
+            # core/views.py + core/case_law_research_views.py in the vendor's
+            # own Django reference client, which is authoritative over the
+            # markdown API doc (which turned out to omit/misdescribe several
+            # fields, including session_id — the reference client sends it
+            # on every single call, main and premium alike).
             max_results = payload.get("max_results", 5)
 
             if tool == "case-laws":
-
+                # MainProvider's /api/v1/case-laws — the "similar case law to
+                # an existing answer" flow. Requires context_answer. NOT what
+                # the "Case Law Research" tool calls (that's provider=premium,
+                # tool=search, below) — kept for a possible future "find
+                # similar case law" action on an existing answer.
                 context_answer = self._get_last_assistant_answer(conversation.id) or query
                 provider_payload = {
                     "query": query,
@@ -697,6 +776,14 @@ class ChatService:
                     "session_id": conversation.id,
                     "message_id": user_message.id,
                 }
+
+            if provider_session.provider_session_token:
+                # Real vendor session token (see get_or_create_provider_session)
+                # — this is what actually gives the vendor bot memory of prior
+                # turns, as opposed to session_id (our own conversation id,
+                # which the vendor doc's v2 contract wants alongside it, not
+                # instead of it).
+                provider_payload["session_token"] = provider_session.provider_session_token
 
             # ---------------------------------------------------------
             # Call AI Provider
@@ -813,7 +900,7 @@ class ChatService:
                 title=self._derive_title(query),
             )
 
-            provider_session = self.get_or_create_provider_session(
+            provider_session = await self.get_or_create_provider_session(
                 conversation_id=conversation.id,
                 provider=provider,
             )
@@ -823,6 +910,16 @@ class ChatService:
                 provider=provider,
                 query=query,
             )
+
+            file_bytes = None
+            if file is not None:
+                file_bytes = await file.read()
+                stored_path = storage.save_file(file_bytes, file.filename or "upload")
+                user_message.attachment_filename = file.filename
+                user_message.attachment_content_type = file.content_type
+                user_message.attachment_size = len(file_bytes)
+                user_message.attachment_path = stored_path
+                self.db.flush()
 
             data = {
                 **extra_fields,
@@ -834,7 +931,9 @@ class ChatService:
                 provider=provider,
                 tool=tool,
                 data=data,
-                file=file,
+                file_bytes=file_bytes,
+                filename=file.filename if file else None,
+                content_type=file.content_type if file else None,
             )
 
             self.save_provider_session_token(provider_session=provider_session, response=response)
@@ -887,21 +986,22 @@ class ChatService:
         response: dict,
     ):
         """
-        Update provider session information from the provider response.
+        Refreshes the stored session token if the provider response
+        includes an updated one. Now that sessions are minted upfront via
+        get_or_create_provider_session (POST /api/v2/sessions), this is
+        just keeping the stored token in sync if the vendor ever rotates
+        it mid-conversation — it's not the primary way we obtain a token
+        anymore. Only the explicit `session_token` key is trusted; the
+        previous fallback to `response.get("conversation_id")` risked
+        clobbering a real token with an unrelated echoed id.
         """
 
-        token = (
-            response.get("session_token")
-            or response.get("conversation_id")
-            or response.get("chat_session")
-        )
+        token = response.get("session_token")
 
         if token:
             provider_session.provider_session_token = token
-
-        provider_session.updated_at = datetime.utcnow()
-
-        self.db.flush()
+            provider_session.updated_at = datetime.utcnow()
+            self.db.flush()
 
     async def call_provider(
         self,
@@ -916,6 +1016,12 @@ class ChatService:
         if provider == "main":
 
             if tool == "chat":
+                # v2 requires session_token per the vendor doc; use it
+                # whenever we have one (the normal case — see
+                # get_or_create_provider_session). Falls back to v1 only if
+                # vendor session creation itself failed for this conversation.
+                if payload.get("session_token"):
+                    return await self.ai_service.query_v2(payload)
                 return await self.ai_service.query(payload)
 
             if tool == "clarify":
@@ -925,11 +1031,22 @@ class ChatService:
                 return await self.ai_service.refine(payload)
 
             if tool == "case-laws":
+                # Only used for the "similar case law to this existing answer"
+                # style flow (requires context_answer). NOT what "Case Law
+                # Research" as a primary chat tool should call — see "premium"/
+                # "search" below, confirmed against the vendor's own reference
+                # client (core/case_law_research_views.py CaseLawSummarizeView).
                 return await self.ai_service.case_laws(payload)
 
         if provider == "premium":
 
             if tool == "search":
+                # This IS "Case Law Research" as a primary ask-style tool —
+                # confirmed against core/case_law_research_views.py
+                # CaseLawSummarizeView, which posts to
+                # /api/judgements/premium/search/ and gets back a normal
+                # {answer, sources, ...} shape, same as main chat. No
+                # context_answer needed for this flow.
                 return await self.ai_service.premium_search(payload)
 
             if tool == "clarify":
@@ -945,18 +1062,38 @@ class ChatService:
         provider: str,
         tool: str,
         data: dict,
-        file=None,
+        file_bytes: bytes | None = None,
+        filename: str | None = None,
+        content_type: str | None = None,
     ):
         """
         Dispatch a multipart request to the existing AIService — the
-        file-upload counterpart to call_provider(). `file` may be None:
-        the vendor's own reference client sends zero-or-more files
+        file-upload counterpart to call_provider(). `file_bytes` may be
+        None: the vendor's own reference client sends zero-or-more files
         (request.FILES.getlist('files')), it's never required.
+
+        Takes already-read bytes (not a FastAPI UploadFile) — the caller
+        (process_document) reads the upload once, both to persist it to
+        disk and to forward it here; passing the UploadFile itself into
+        httpx doesn't work (see historical note below).
+
+        Multipart field name "file" is now confirmed against the vendor's
+        actual FastAPI source: both /api/notice/process-file and
+        /api/summarize/file declare `file: UploadFile = File(...)` — in
+        FastAPI, that parameter name IS the expected multipart field name.
+
+        HISTORICAL BUG (fixed): this used to build `files={"file": file}`
+        with the raw FastAPI/Starlette UploadFile object. httpx's `files=`
+        needs actual bytes (or a sync file-like object); UploadFile.read()
+        is an async coroutine, and httpx's multipart encoder calls .read()
+        synchronously — so it was sending an un-awaited coroutine object as
+        the file content instead of real bytes. Every notice/summarizer
+        call with a file attached failed because of this.
         """
+
         files = {}
-        if file is not None:
-            file_bytes = await file.read()
-            files["file"] = (file.filename, file_bytes, file.content_type)
+        if file_bytes is not None:
+            files["file"] = (filename, file_bytes, content_type)
 
         if provider == "notice" and tool == "process":
             return await self.ai_service.generate_notice_reply(data=data, files=files)

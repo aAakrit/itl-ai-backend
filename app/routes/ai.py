@@ -4,8 +4,11 @@ AI Routes
 Exposes endpoints for interacting with external AI services.
 """
 
+import time
+from datetime import datetime
+
 from app.models.user import User
-from app.routes.auth import get_current_user
+from app.routes.auth import get_current_user, require_admin
 from app.services.chat import ChatService
 from app.utils.chat import get_chat_service
 from fastapi import (
@@ -13,10 +16,12 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Response,
     UploadFile,
     status,
 )
 from fastapi import Depends
+from app.utils import storage
 from app.schemas.ai import (
     AIQueryRequest,
     AIResponse,
@@ -191,15 +196,21 @@ async def create_session(request: SessionCreateRequest):
     )
 
 
-@router.post(
+@router.get(
     "/analytics",
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="AI Analytics",
-    description="Retrieve analytics for AI interactions.",
+    description="Retrieve analytics for AI interactions. Admin only.",
 )
-async def analytics(request: AnalyticsRequest):
-    result = await ai_service.analytics(request.dict())
+async def analytics(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    current_user: User = Depends(require_admin),
+):
+    result = await ai_service.analytics(
+        {k: v for k, v in {"start_date": start_date, "end_date": end_date}.items() if v is not None}
+    )
 
     return success_response(
         data=result,
@@ -334,6 +345,35 @@ async def message_refine(
     return success_response(
         data=chat.serialize_message(refined),
         message="Message refined successfully.",
+    )
+
+
+@router.get(
+    "/messages/{message_id}/attachment",
+    summary="Download Message Attachment",
+    description="Download the original file uploaded with a Notice Reply / Summarizer message.",
+)
+async def download_message_attachment(
+    message_id: int,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    message = chat.get_owned_message(current_user.id, message_id)
+
+    if not message or not message.attachment_path:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+
+    try:
+        content = storage.read_file(message.attachment_path)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Attachment file is missing from storage.")
+
+    return Response(
+        content=content,
+        media_type=message.attachment_content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{message.attachment_filename or "download"}"',
+        },
     )
 
 # =============================================================================
@@ -658,7 +698,28 @@ async def health():
     result = {}
 
     for provider in providers:
-        result[provider] = await ai_service.health(provider)
+        started = time.monotonic()
+        checked_at = datetime.utcnow().isoformat()
+        try:
+            raw = await ai_service.health(provider)
+            result[provider] = {
+                "status": "healthy",
+                "response_time_ms": round((time.monotonic() - started) * 1000),
+                "last_checked": checked_at,
+                "error": None,
+                "details": raw,
+            }
+        except Exception as exc:
+            # A single down provider must not take out the health check for
+            # every other provider — this previously let one provider's
+            # exception propagate and fail the entire /ai/health call.
+            result[provider] = {
+                "status": "unhealthy",
+                "response_time_ms": round((time.monotonic() - started) * 1000),
+                "last_checked": checked_at,
+                "error": str(exc),
+                "details": None,
+            }
 
     return success_response(
         data=result,

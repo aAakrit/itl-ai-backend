@@ -81,11 +81,13 @@ class MainProvider(BaseProvider):
             payload=payload,
         )
 
-    async def analytics(self, payload: dict[str, Any]) -> dict:
+    async def analytics(self, params: dict[str, Any] | None = None) -> dict:
         """
-        Fetch analytics information.
+        Fetch analytics information. Confirmed GET /api/v2/analytics/summary
+        per the vendor endpoint doc — was previously a POST to a
+        never-defined MainEndpoints.ANALYTICS constant.
         """
-        return await self.post(
+        return await self.get(
             endpoint=MainEndpoints.ANALYTICS,
-            payload=payload,
+            params=params,
         )

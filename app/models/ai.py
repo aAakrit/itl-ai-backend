@@ -306,6 +306,16 @@ class AIMessage(Base):
         nullable=True,
     )
 
+    # Uploaded document metadata (Notice Reply / Summarizer). Attached to
+    # the USER message row, since the upload is something the user
+    # provided. `attachment_path` is a storage-relative path (see
+    # app/utils/storage.py), never served directly — always through the
+    # authenticated /ai/messages/{id}/attachment download route.
+    attachment_filename = Column(String(255), nullable=True)
+    attachment_content_type = Column(String(100), nullable=True)
+    attachment_size = Column(Integer, nullable=True)
+    attachment_path = Column(String(500), nullable=True)
+
     # ------------------------------------------------------------------
     # Structured Response
     # ------------------------------------------------------------------
