@@ -45,12 +45,12 @@ class FreeEndpoints:
 
 
 class NoticeEndpoints:
-    GENERATE = "/process_notice"
+    GENERATE = "/api/notice/process/"
 
     HEALTH = "/api/health"
 
 
 class SummarizerEndpoints:
-    SUMMARIZE = "/summarize"
+    SUMMARIZE = "/api/summarize/text/"
 
     HEALTH = "/api/health"
