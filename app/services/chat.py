@@ -679,6 +679,7 @@ class ChatService:
             max_results = payload.get("max_results", 5)
 
             if tool == "case-laws":
+
                 context_answer = self._get_last_assistant_answer(conversation.id) or query
                 provider_payload = {
                     "query": query,
@@ -952,8 +953,10 @@ class ChatService:
         the vendor's own reference client sends zero-or-more files
         (request.FILES.getlist('files')), it's never required.
         """
-
-        files = {"file": file} if file is not None else {}
+        files = {}
+        if file is not None:
+            file_bytes = await file.read()
+            files["file"] = (file.filename, file_bytes, file.content_type)
 
         if provider == "notice" and tool == "process":
             return await self.ai_service.generate_notice_reply(data=data, files=files)
