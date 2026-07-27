@@ -70,6 +70,23 @@ class BaseProvider:
             files=files,
         )
 
+    async def upload_sse(
+        self,
+        endpoint: str,
+        data: dict[str, Any],
+        files: dict[str, Any],
+    ) -> dict:
+        """
+        Execute a multipart/form-data request whose response is a
+        Server-Sent-Events stream (see GatewayClient.post_multipart_sse).
+        """
+        return await self.client.post_multipart_sse(
+            base_url=self.base_url,
+            endpoint=endpoint,
+            data=data,
+            files=files,
+        )
+
     async def health(self) -> dict:
         """
         Check provider health.

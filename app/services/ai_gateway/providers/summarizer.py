@@ -22,7 +22,8 @@ class SummarizerProvider(BaseProvider):
         data: dict,
         files: dict,
     ) -> dict:
-        return await self.upload(
+
+        return await self.upload_sse(
             endpoint=SummarizerEndpoints.SUMMARIZE,
             data=data,
             files=files,

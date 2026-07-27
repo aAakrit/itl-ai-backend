@@ -189,11 +189,29 @@ class ChatService:
         Different vendor tools return meaningfully different shapes:
           - chat / refine-ish tools: {"answer": "...", "sources": [...]}
           - case-laws bridge: {"results": [...]} — no `answer` field at all.
+          - notice: {"generated_reply": "...", "notice_info": {...}}
+          - summarizer: {"content": "...", "notice_info": {...}}
         `save_ai_message` (and everything downstream: serialize_message,
         the frontend) expects a single normalized {"answer", "sources"}
         shape, so tool-specific responses are mapped to it here rather than
         leaking vendor-specific shapes into message storage.
         """
+
+        if tool == "process":
+            # Notice Reply — confirmed against core/draft_assistant.py.
+            return {
+                **response,
+                "answer": response.get("generated_reply") or response.get("answer"),
+                "sources": response.get("sources"),
+            }
+
+        if tool == "summarize":
+            # Summarizer — confirmed against core/summarizer.py.
+            return {
+                **response,
+                "answer": response.get("content") or response.get("answer"),
+                "sources": response.get("sources"),
+            }
 
         if tool != "case-laws":
             return response
@@ -658,20 +676,9 @@ class ChatService:
             # ---------------------------------------------------------
             # Provider Payload
             # ---------------------------------------------------------
-            # Built per-tool against the vendor's confirmed contract — see
-            # core/views.py + core/case_law_research_views.py in the vendor's
-            # own Django reference client, which is authoritative over the
-            # markdown API doc (which turned out to omit/misdescribe several
-            # fields, including session_id — the reference client sends it
-            # on every single call, main and premium alike).
             max_results = payload.get("max_results", 5)
 
             if tool == "case-laws":
-                # MainProvider's /api/v1/case-laws — the "similar case law to
-                # an existing answer" flow. Requires context_answer. NOT what
-                # the "Case Law Research" tool calls (that's provider=premium,
-                # tool=search, below) — kept for a possible future "find
-                # similar case law" action on an existing answer.
                 context_answer = self._get_last_assistant_answer(conversation.id) or query
                 provider_payload = {
                     "query": query,
@@ -768,6 +775,111 @@ class ChatService:
             self.db.rollback()
             raise
 
+    # ------------------------------------------------------------------
+    # File-upload tools (Notice Reply, Summarizer)
+    # ------------------------------------------------------------------
+
+    async def process_document(
+        self,
+        *,
+        user_id: int,
+        query: str,
+        provider: str,
+        tool: str,
+        module: str,
+        conversation_id: Optional[int] = None,
+        file=None,
+        extra_fields: Optional[dict] = None,
+    ) -> dict:
+        """
+        The multipart-upload equivalent of query() — same conversation/
+        session/message bookkeeping, reused rather than duplicated, but
+        dispatches through call_upload_provider() (multipart) instead of
+        call_provider() (JSON), since Notice Reply and Summarizer are both
+        file-upload endpoints on the vendor side (core/draft_assistant.py,
+        core/summarizer.py).
+        """
+
+        extra_fields = extra_fields or {}
+
+        try:
+            conversation = self.get_or_create_conversation(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                provider=provider,
+                tool=tool,
+                module=module,
+                title=self._derive_title(query),
+            )
+
+            provider_session = self.get_or_create_provider_session(
+                conversation_id=conversation.id,
+                provider=provider,
+            )
+
+            user_message = self.save_user_message(
+                conversation_id=conversation.id,
+                provider=provider,
+                query=query,
+            )
+
+            data = {
+                **extra_fields,
+                "session_id": conversation.id,
+                "message_id": user_message.id,
+            }
+
+            response = await self.call_upload_provider(
+                provider=provider,
+                tool=tool,
+                data=data,
+                file=file,
+            )
+
+            self.save_provider_session_token(provider_session=provider_session, response=response)
+
+            assistant_message = self.save_ai_message(
+                conversation_id=conversation.id,
+                provider=provider,
+                response=self._normalize_provider_response(tool, response),
+                parent_message_id=user_message.id,
+            )
+
+            self.update_conversation(conversation=conversation, provider=provider)
+
+            self.db.commit()
+
+            self.db.refresh(conversation)
+            self.db.refresh(user_message)
+            self.db.refresh(assistant_message)
+
+            return {
+                "conversation": {
+                    "id": conversation.id,
+                    "title": conversation.title,
+                    "provider": conversation.provider,
+                    "tool": conversation.tool,
+                    "module": conversation.module,
+                    "updated_at": conversation.updated_at,
+                    "last_message_at": conversation.last_message_at,
+                },
+                "user_message": {
+                    "id": user_message.id,
+                    "query": user_message.query,
+                    "created_at": user_message.created_at,
+                },
+                "assistant_message": {
+                    "id": assistant_message.id,
+                    "answer": assistant_message.answer,
+                    "sources": assistant_message.sources,
+                    "created_at": assistant_message.created_at,
+                },
+            }
+
+        except Exception:
+            self.db.rollback()
+            raise
+
     def save_provider_session_token(
         self,
         provider_session,
@@ -826,3 +938,27 @@ class ChatService:
                 return await self.ai_service.premium_refine(payload)
 
         raise ValueError(f"Unsupported provider/tool: {provider}/{tool}")
+
+    async def call_upload_provider(
+        self,
+        provider: str,
+        tool: str,
+        data: dict,
+        file=None,
+    ):
+        """
+        Dispatch a multipart request to the existing AIService — the
+        file-upload counterpart to call_provider(). `file` may be None:
+        the vendor's own reference client sends zero-or-more files
+        (request.FILES.getlist('files')), it's never required.
+        """
+
+        files = {"file": file} if file is not None else {}
+
+        if provider == "notice" and tool == "process":
+            return await self.ai_service.generate_notice_reply(data=data, files=files)
+
+        if provider == "summarizer" and tool == "summarize":
+            return await self.ai_service.summarize_document(data=data, files=files)
+
+        raise ValueError(f"Unsupported upload provider/tool: {provider}/{tool}")

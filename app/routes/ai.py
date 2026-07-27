@@ -531,21 +531,49 @@ async def free_similar(request: SimilarRequest):
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Generate Notice Reply",
-    description="Generate a legal notice reply from uploaded documents.",
+    description="Generate a legal notice reply, optionally from an uploaded document.",
 )
 async def generate_notice_reply(
-    prompt: str = Form(...),
-    session_id: str | None = Form(None),
-    file: UploadFile = File(...),
+    query: str = Form(""),
+    conversation_id: int | None = Form(None),
+    module_id: str = Form("gst"),
+    gstin: str | None = Form(None),
+    file: UploadFile | None = File(None),
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
 ):
-    payload = {
-        "prompt": prompt,
-        "session_id": session_id,
-    }
+    # Vendor API doc (Section 4.1): "either file or text required" — neither
+    # is individually required, but at least one must be present.
+    if not query.strip() and not file:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either notice text or an attached file.",
+        )
 
-    result = await ai_service.generate_notice_reply(
-        data=payload,
-        files={"file": file},
+    # What we store/display in our own conversation history — synthesized
+    # from the filename when only a file was provided, so the sidebar/title
+    # isn't just blank. `notice_text` sent to the vendor stays the true,
+    # possibly-empty raw query — synthesizing text there would misrepresent
+    # what the user actually gave the notice-analysis model.
+    display_query = query.strip() or f"[Notice file: {file.filename}]"
+
+    result = await chat.process_document(
+        user_id=current_user.id,
+        query=display_query,
+        provider="notice",
+        tool="process",
+        module=module_id,
+        conversation_id=conversation_id,
+        file=file,
+        extra_fields={
+            # Confirmed against the vendor's Notice Reply Agent API doc
+            # (Section 4.1) — field is `notice_text`, not `prompt`/`query`.
+            "notice_text": query,
+            "user_name": current_user.name or "",
+            "business_name": current_user.firm or "",
+            "gstin": gstin or "",
+            "address": current_user.address or "",
+        },
     )
 
     return success_response(
@@ -564,21 +592,40 @@ async def generate_notice_reply(
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Summarize Document",
-    description="Generate an AI summary for the uploaded document.",
+    description="Generate an AI summary, optionally from an uploaded document.",
 )
 async def summarize_document(
-    prompt: str = Form(...),
-    session_id: str | None = Form(None),
-    file: UploadFile = File(...),
+    query: str = Form(""),
+    conversation_id: int | None = Form(None),
+    module_id: str = Form("gst"),
+    max_length: int = Form(500),
+    file: UploadFile | None = File(None),
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
 ):
-    payload = {
-        "prompt": prompt,
-        "session_id": session_id,
-    }
+    if not query.strip() and not file:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either text to summarize or an attached file.",
+        )
 
-    result = await ai_service.summarize_document(
-        data=payload,
-        files={"file": file},
+    display_query = query.strip() or f"[Summarize file: {file.filename}]"
+
+    result = await chat.process_document(
+        user_id=current_user.id,
+        query=display_query,
+        provider="summarizer",
+        tool="summarize",
+        module=module_id,
+        conversation_id=conversation_id,
+        file=file,
+        extra_fields={
+            # Confirmed against the vendor's Document Summarizer API doc
+            # (Section 5.1) — field is `main_content`, not `prompt`/`query`.
+            # `max_length` doc range is 0-2000, default 500.
+            "main_content": query,
+            "max_length": max(1, min(max_length, 2000)),
+        },
     )
 
     return success_response(

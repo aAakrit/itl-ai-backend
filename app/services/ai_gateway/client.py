@@ -16,6 +16,7 @@ Providers are responsible for deciding which endpoint to call.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -173,6 +174,71 @@ class GatewayClient:
 
             return self._parse_response(response)
 
+        except Exception as exc:
+            self._handle_exception(exc)
+
+    async def post_multipart_sse(
+        self,
+        base_url: str,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> dict:
+        """
+        Execute a multipart/form-data POST whose response is a
+        Server-Sent-Events stream (Document Summarizer confirmed against
+        the vendor API doc, Section 5.1) — NOT a single JSON body, so
+        `post_multipart`'s `response.json()` would raise on it.
+
+        Each event line looks like `data: {"content": "..."}`, ending with
+        `data: {"done": true}`, or `data: {"success": false, "error": "..."}`
+        on failure. Chunks are concatenated into one `content` string so
+        callers can treat this exactly like any other JSON-returning
+        provider call — streaming this incrementally to the frontend is a
+        separate, larger change (would need SSE end-to-end, not just here).
+        """
+
+        try:
+            async with self._client.stream(
+                "POST",
+                self._build_url(base_url, endpoint),
+                data=data or {},
+                files=files or {},
+            ) as response:
+                response.raise_for_status()
+
+                content_parts: list[str] = []
+                error: str | None = None
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+
+                    raw = line[len("data:"):].strip()
+                    if not raw:
+                        continue
+
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+
+                    if event.get("done"):
+                        break
+                    if event.get("success") is False:
+                        error = event.get("error", "Summarization failed.")
+                        break
+                    if "content" in event:
+                        content_parts.append(event["content"])
+
+                if error:
+                    raise AIResponseException(status_code=response.status_code, detail=error)
+
+                return {"success": True, "content": "".join(content_parts)}
+
+        except AIResponseException:
+            raise
         except Exception as exc:
             self._handle_exception(exc)
 
