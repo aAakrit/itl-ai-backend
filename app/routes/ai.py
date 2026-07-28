@@ -4,6 +4,7 @@ AI Routes
 Exposes endpoints for interacting with external AI services.
 """
 
+import os
 import time
 from datetime import datetime
 
@@ -565,6 +566,8 @@ async def free_similar(request: SimilarRequest):
 # Notice Reply AI
 # =============================================================================
 
+ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt"}
+
 
 @router.post(
     "/notice/generate",
@@ -582,20 +585,38 @@ async def generate_notice_reply(
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
-    # Vendor API doc (Section 4.1): "either file or text required" — neither
-    # is individually required, but at least one must be present.
+    # Vendor's two real endpoints (confirmed against actual FastAPI source):
+    # POST /api/notice/process (JSON, text-only, notice_text required) and
+    # POST /api/notice/process-file (multipart, file-only, no notice_text
+    # field at all — text is extracted from the file server-side). So
+    # unlike the file endpoint's own "any of .pdf/.docx/.txt", here at
+    # least one of file/text is still required from OUR side.
     if not query.strip() and not file:
         raise HTTPException(
             status_code=422,
             detail="Provide either notice text or an attached file.",
         )
 
-    # What we store/display in our own conversation history — synthesized
-    # from the filename when only a file was provided, so the sidebar/title
-    # isn't just blank. `notice_text` sent to the vendor stays the true,
-    # possibly-empty raw query — synthesizing text there would misrepresent
-    # what the user actually gave the notice-analysis model.
+    if file and file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_DOCUMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Use PDF, DOCX, or TXT.")
+
     display_query = query.strip() or f"[Notice file: {file.filename}]"
+
+    # user_name/business_name/gstin/address are accepted by BOTH vendor
+    # endpoints — notice_text is NOT (it only exists on the text endpoint;
+    # process_document/call_upload_provider pick the right vendor endpoint
+    # based on whether a file is present, so only include notice_text when
+    # there isn't one).
+    extra_fields = {
+        "user_name": current_user.name or "",
+        "business_name": current_user.firm or "",
+        "gstin": gstin or "",
+        "address": current_user.address or "",
+    }
+    if not file:
+        extra_fields["notice_text"] = query
 
     result = await chat.process_document(
         user_id=current_user.id,
@@ -605,20 +626,28 @@ async def generate_notice_reply(
         module=module_id,
         conversation_id=conversation_id,
         file=file,
-        extra_fields={
-            # Confirmed against the vendor's Notice Reply Agent API doc
-            # (Section 4.1) — field is `notice_text`, not `prompt`/`query`.
-            "notice_text": query,
-            "user_name": current_user.name or "",
-            "business_name": current_user.firm or "",
-            "gstin": gstin or "",
-            "address": current_user.address or "",
-        },
+        extra_fields=extra_fields,
     )
 
     return success_response(
         data=result,
         message="Notice reply generated successfully.",
+    )
+
+
+@router.get(
+    "/notice/types",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List Notice Types",
+    description="List the notice types the Notice Reply agent recognizes.",
+)
+async def list_notice_types(current_user: User = Depends(get_current_user)):
+    result = await ai_service.get_notice_types()
+
+    return success_response(
+        data=result,
+        message="Notice types retrieved successfully.",
     )
 
 
@@ -638,18 +667,47 @@ async def summarize_document(
     query: str = Form(""),
     conversation_id: int | None = Form(None),
     module_id: str = Form("gst"),
-    max_length: int = Form(500),
+    user_instructions: str = Form(""),
+    output_format: str | None = Form(None),
     file: UploadFile | None = File(None),
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
+    # Vendor's two real endpoints (confirmed against actual FastAPI source):
+    # POST /api/summarize/text (JSON — SummarizeTextRequest: document_text
+    # required, min 50 / max 200000 chars) and POST /api/summarize/file
+    # (multipart — no document_text field at all, text is extracted from
+    # the file). Neither streams SSE — a prior doc claimed otherwise; the
+    # actual source code overrides that.
     if not query.strip() and not file:
         raise HTTPException(
             status_code=422,
             detail="Provide either text to summarize or an attached file.",
         )
 
+    if file and file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_DOCUMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Use PDF, DOCX, or TXT.")
+
+    if not file and len(query.strip()) < 50:
+        # Vendor's own Pydantic min_length=50 on document_text — checked
+        # here too so the person gets a clear, immediate message instead of
+        # a raw vendor 422.
+        raise HTTPException(
+            status_code=422,
+            detail="Text to summarize must be at least 50 characters (or attach a file instead).",
+        )
+
     display_query = query.strip() or f"[Summarize file: {file.filename}]"
+
+    # document_text only exists on the text endpoint — omitted when a file
+    # is present, same reasoning as notice_text above.
+    extra_fields = {"user_instructions": user_instructions}
+    if output_format:
+        extra_fields["output_format"] = output_format
+    if not file:
+        extra_fields["document_text"] = query
 
     result = await chat.process_document(
         user_id=current_user.id,
@@ -659,13 +717,7 @@ async def summarize_document(
         module=module_id,
         conversation_id=conversation_id,
         file=file,
-        extra_fields={
-            # Confirmed against the vendor's Document Summarizer API doc
-            # (Section 5.1) — field is `main_content`, not `prompt`/`query`.
-            # `max_length` doc range is 0-2000, default 500.
-            "main_content": query,
-            "max_length": max(1, min(max_length, 2000)),
-        },
+        extra_fields=extra_fields,
     )
 
     return success_response(

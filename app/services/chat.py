@@ -245,27 +245,38 @@ class ChatService:
         Different vendor tools return meaningfully different shapes:
           - chat / refine-ish tools: {"answer": "...", "sources": [...]}
           - case-laws bridge: {"results": [...]} — no `answer` field at all.
-          - notice: {"generated_reply": "...", "notice_info": {...}}
-          - summarizer: {"content": "...", "notice_info": {...}}
+          - notice / summarize: shape is NOT fully confirmed. We have the
+            vendor's actual route/request code (endpoints, Pydantic models)
+            but not the body of run_notice_pipeline()/run_summarizer_pipeline()
+            that builds the response, so the exact output key names are a
+            best-effort guess with a defensive fallback chain — verify
+            against a live response and tighten this once confirmed.
         `save_ai_message` (and everything downstream: serialize_message,
         the frontend) expects a single normalized {"answer", "sources"}
         shape, so tool-specific responses are mapped to it here rather than
         leaking vendor-specific shapes into message storage.
         """
 
-        if tool == "process":
-            # Notice Reply — confirmed against core/draft_assistant.py.
-            return {
-                **response,
-                "answer": response.get("generated_reply") or response.get("answer"),
-                "sources": response.get("sources"),
-            }
+        if tool in ("process", "summarize"):
+            answer = (
+                response.get("generated_reply")
+                or response.get("summary")
+                or response.get("content")
+                or response.get("answer")
+                or response.get("text")
+            )
+            if not answer:
+                # None of the guessed keys matched — surface the raw
+                # response rather than silently saving an empty message,
+                # so at minimum nothing is lost and the real shape is
+                # visible for fixing this fallback chain properly.
+                import json as _json
 
-        if tool == "summarize":
-            # Summarizer — confirmed against core/summarizer.py.
+                answer = f"_(Unrecognized response shape — raw response below)_\n\n```json\n{_json.dumps(response, indent=2, default=str)}\n```"
+
             return {
                 **response,
-                "answer": response.get("content") or response.get("answer"),
+                "answer": answer,
                 "sources": response.get("sources"),
             }
 
@@ -921,11 +932,12 @@ class ChatService:
                 user_message.attachment_path = stored_path
                 self.db.flush()
 
-            data = {
-                **extra_fields,
-                "session_id": conversation.id,
-                "message_id": user_message.id,
-            }
+            # Unlike query()/refine() (main bot, premium), notice/summarizer's
+            # actual vendor request models (NoticeRequest, SummarizeTextRequest)
+            # don't declare session_id/message_id fields at all — sending them
+            # risks a 422 if the model forbids extra fields. `data` is exactly
+            # what the route built in extra_fields, nothing added here.
+            data = dict(extra_fields)
 
             response = await self.call_upload_provider(
                 provider=provider,
