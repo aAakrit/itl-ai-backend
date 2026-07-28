@@ -346,6 +346,10 @@ class ChatService:
 
             web_search_used=response.get("web_search_used"),
 
+            needs_clarification=response.get("needs_clarification", False),
+
+            deep_research_used=response.get("deep_research_used", False),
+
             provider_message_id=response.get("message_id"),
 
             provider_search_id=response.get("search_id"),
@@ -672,6 +676,8 @@ class ChatService:
             "query_time_ms": message.query_time_ms,
             "sources": message.sources,
             "related_judgements": message.related_judgements,
+            "needs_clarification": message.needs_clarification,
+            "deep_research_used": message.deep_research_used,
             "feedback": message.feedback,
             "attachment": attachment,
             "created_at": message.created_at,

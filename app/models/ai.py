@@ -299,6 +299,19 @@ class AIMessage(Base):
         default=False,
     )
 
+    # Vendor's /api/v1/query (and v2) response flags — needs_clarification
+    # means `answer` is actually a clarifying QUESTION, not a real answer
+    # (must render distinctly, not as a normal assistant reply).
+    needs_clarification = Column(
+        Boolean,
+        default=False,
+    )
+
+    deep_research_used = Column(
+        Boolean,
+        default=False,
+    )
+
     # "up" | "down" | null. Set once, then locked — enforced in the route,
     # not just the UI, so a replayed request can't submit feedback twice.
     feedback = Column(
@@ -564,3 +577,4 @@ class AIFeedback(Base):
         "AIMessage",
         back_populates="feedback",
     )
+
