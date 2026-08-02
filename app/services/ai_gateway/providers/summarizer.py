@@ -33,14 +33,33 @@ class SummarizerProvider(BaseProvider):
             payload=data,
         )
 
-    async def summarize_file(self, data: dict, files: dict) -> dict:
+    async def summarize_file(self, data: dict, files: dict, force_async: bool = False, force_sync: bool = False) -> dict:
         """
         POST /api/summarize/file — multipart, file-only. No document_text
         field; text is extracted from the uploaded file server-side
         (max 20MB, .pdf/.docx/.txt only).
+
+        Vendor now branches on document size: small docs return the full
+        result inline (mode: "sync"); large docs return HTTP 202 with a
+        job_id instead (mode: "async") — see get_job_status/get_job_result.
+        `force_async`/`force_sync` map to the vendor's own query params.
         """
+        endpoint = SummarizerEndpoints.SUMMARIZE_FILE
+        if force_async:
+            endpoint += "?force_async=true"
+        elif force_sync:
+            endpoint += "?force_sync=true"
+
         return await self.upload(
-            endpoint=SummarizerEndpoints.SUMMARIZE_FILE,
+            endpoint=endpoint,
             data=data,
             files=files,
         )
+
+    async def get_job_status(self, job_id: str) -> dict:
+        """GET /api/summarize/status/{job_id}"""
+        return await self.get(endpoint=f"{SummarizerEndpoints.STATUS}/{job_id}")
+
+    async def get_job_result(self, job_id: str) -> dict:
+        """GET /api/summarize/result/{job_id}"""
+        return await self.get(endpoint=f"{SummarizerEndpoints.RESULT}/{job_id}")

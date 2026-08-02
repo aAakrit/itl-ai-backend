@@ -116,10 +116,18 @@ class AIService:
         self,
         data: dict[str, Any],
         files: dict[str, Any] | None = None,
+        force_async: bool = False,
+        force_sync: bool = False,
     ) -> dict:
         if files:
-            return await self.summarizer.summarize_file(data, files)
+            return await self.summarizer.summarize_file(data, files, force_async=force_async, force_sync=force_sync)
         return await self.summarizer.summarize_text(data)
+
+    async def summarizer_job_status(self, job_id: str) -> dict:
+        return await self.summarizer.get_job_status(job_id)
+
+    async def summarizer_job_result(self, job_id: str) -> dict:
+        return await self.summarizer.get_job_result(job_id)
 
     async def health(self, provider: str):
         return await ai_gateway.get_provider(provider).health()

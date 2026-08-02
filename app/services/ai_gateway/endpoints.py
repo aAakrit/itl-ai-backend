@@ -50,13 +50,14 @@ class NoticeEndpoints:
     PROCESS_TEXT = "/api/notice/process"
 
     PROCESS_FILE = "/api/notice/process-file"
-
+    TYPES = "/api/notice/types"
     HEALTH = "/api/health"
 
 
 class SummarizerEndpoints:
     SUMMARIZE_TEXT = "/api/summarize/text"
-    
-    SUMMARIZE_FILE = "/api/summarize/file"
 
+    SUMMARIZE_FILE = "/api/summarize/file"
+    STATUS = "/api/summarize/status"
+    RESULT = "/api/summarize/result"
     HEALTH = "/api/health"

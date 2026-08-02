@@ -8,6 +8,7 @@ from app.models.ai import AIConversation, AIMessage
 from app.models.ai import AIProviderSession
 
 from app.services.ai_service import ai_service
+from app.services.ai_gateway.exceptions import AIResponseException
 from app.utils import storage
 
 logger = logging.getLogger(__name__)
@@ -260,6 +261,12 @@ class ChatService:
         if tool in ("process", "summarize"):
             answer = (
                 response.get("generated_reply")
+                # Confirmed field name for Summarizer results (both sync
+                # and async) — "Everything the frontend already reads
+                # (formatted_output, extracted_fields, modules,
+                # verification, document_integrity_note, disclaimer) is
+                # unchanged" per the vendor's summarizer update notes.
+                or response.get("formatted_output")
                 or response.get("summary")
                 or response.get("content")
                 or response.get("answer")
@@ -531,6 +538,8 @@ class ChatService:
             },
         )
 
+        self._raise_if_pipeline_error(response)
+
         self.save_provider_session_token(provider_session=provider_session, response=response)
 
         # Vendor's /refine response key is `refined_answer`, not `answer`.
@@ -680,6 +689,7 @@ class ChatService:
             "deep_research_used": message.deep_research_used,
             "feedback": message.feedback,
             "attachment": attachment,
+            "job_id": message.provider_job_id,
             "created_at": message.created_at,
         }
 
@@ -811,6 +821,8 @@ class ChatService:
                 payload=provider_payload,
             )
 
+            self._raise_if_pipeline_error(response)
+
             # ---------------------------------------------------------
             # Save Session Token
             # ---------------------------------------------------------
@@ -895,6 +907,8 @@ class ChatService:
         conversation_id: Optional[int] = None,
         file=None,
         extra_fields: Optional[dict] = None,
+        force_async: bool = False,
+        force_sync: bool = False,
     ) -> dict:
         """
         The multipart-upload equivalent of query() — same conversation/
@@ -952,9 +966,59 @@ class ChatService:
                 file_bytes=file_bytes,
                 filename=file.filename if file else None,
                 content_type=file.content_type if file else None,
+                force_async=force_async,
+                force_sync=force_sync,
             )
 
+            self._raise_if_pipeline_error(response)
+
             self.save_provider_session_token(provider_session=provider_session, response=response)
+
+            if response.get("mode") == "async":
+                # Summarizer's large-document job flow — no answer yet.
+                # Save a placeholder the frontend can show as "processing"
+                # and poll against; get_job_status/finalize_job fill it in
+                # once the vendor's background job completes.
+                assistant_message = self.save_ai_message(
+                    conversation_id=conversation.id,
+                    provider=provider,
+                    response={"answer": None, "sources": None},
+                    parent_message_id=user_message.id,
+                )
+                assistant_message.status = "processing"
+                assistant_message.provider_job_id = response.get("job_id")
+
+                self.update_conversation(conversation=conversation, provider=provider)
+                self.db.commit()
+                self.db.refresh(conversation)
+                self.db.refresh(user_message)
+                self.db.refresh(assistant_message)
+
+                return {
+                    "conversation": {
+                        "id": conversation.id,
+                        "title": conversation.title,
+                        "provider": conversation.provider,
+                        "tool": conversation.tool,
+                        "module": conversation.module,
+                        "updated_at": conversation.updated_at,
+                        "last_message_at": conversation.last_message_at,
+                    },
+                    "user_message": {
+                        "id": user_message.id,
+                        "query": user_message.query,
+                        "created_at": user_message.created_at,
+                    },
+                    "assistant_message": {
+                        "id": assistant_message.id,
+                        "answer": None,
+                        "status": "processing",
+                        "job_id": response.get("job_id"),
+                        "filename": response.get("filename"),
+                        "est_pages": response.get("est_pages"),
+                        "created_at": assistant_message.created_at,
+                    },
+                }
 
             assistant_message = self.save_ai_message(
                 conversation_id=conversation.id,
@@ -998,6 +1062,99 @@ class ChatService:
             self.db.rollback()
             raise
 
+    # ------------------------------------------------------------------
+    # Async job polling (Summarizer large-document flow)
+    # ------------------------------------------------------------------
+
+    def _get_message_by_job_id(self, user_id: int, job_id: str) -> AIMessage:
+        message = (
+            self.db.query(AIMessage)
+            .join(AIConversation, AIMessage.conversation_id == AIConversation.id)
+            .filter(
+                AIMessage.provider_job_id == job_id,
+                AIConversation.user_id == user_id,
+                AIConversation.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+        if not message:
+            raise LookupError("Job not found.")
+
+        return message
+
+    async def get_job_status(self, user_id: int, job_id: str) -> dict:
+        """
+        GET /api/summarize/status/{job_id}, ownership-checked via the
+        message that was created when the job was submitted.
+        """
+
+        self._get_message_by_job_id(user_id, job_id)  # ownership check only
+
+        return await self.ai_service.summarizer_job_status(job_id)
+
+    async def finalize_job(self, user_id: int, job_id: str) -> dict:
+        """
+        Checks a job's result and, if done, saves the real answer onto the
+        placeholder message created when the job was submitted — turning
+        it from "processing" into a normal completed assistant message.
+        Idempotent: if already finalized, just returns the saved message
+        without re-hitting the vendor.
+        """
+
+        message = self._get_message_by_job_id(user_id, job_id)
+
+        if message.status != "processing":
+            conversation = (
+                self.db.query(AIConversation)
+                .filter(AIConversation.id == message.conversation_id)
+                .first()
+            )
+            return {"ready": True, "conversation_id": conversation.id, "message": self.serialize_message(message)}
+
+        result = await self.ai_service.summarizer_job_result(job_id)
+
+        status = result.get("status")
+
+        if status == "error" or result.get("detail"):
+            message.status = "error"
+            self.db.commit()
+            raise AIResponseException(
+                status_code=502,
+                detail=result.get("error") or result.get("detail") or "Summarization job failed.",
+            )
+
+        if status and status != "done":
+            # Polled before it was ready — 202-equivalent, pass the
+            # progress info straight through.
+            return {
+                "ready": False,
+                "status": status,
+                "stage": result.get("stage"),
+                "progress": result.get("progress"),
+            }
+
+        self._raise_if_pipeline_error(result)
+
+        normalized = self._normalize_provider_response("summarize", result)
+        message.answer = normalized.get("answer")
+        message.sources = normalized.get("sources")
+        message.status = "completed"
+        message.provider_message_id = result.get("message_id") or message.provider_message_id
+
+        self.db.commit()
+        self.db.refresh(message)
+
+        conversation = (
+            self.db.query(AIConversation)
+            .filter(AIConversation.id == message.conversation_id)
+            .first()
+        )
+        self.update_conversation(conversation=conversation, provider=message.provider)
+        self.db.commit()
+
+        return {"ready": True, "conversation_id": conversation.id, "message": self.serialize_message(message)}
+
     def save_provider_session_token(
         self,
         provider_session,
@@ -1020,6 +1177,33 @@ class ChatService:
             provider_session.provider_session_token = token
             provider_session.updated_at = datetime.utcnow()
             self.db.flush()
+
+    def _raise_if_pipeline_error(self, response: dict) -> None:
+        """
+        The vendor's own pipeline can fail internally while still returning
+        HTTP 200 — e.g. `{"answer": "Error: 'unverified_labels'", "confidence":
+        0.0, "verification": null, "sources": []}`. Nothing about that is an
+        HTTP-level failure (raise_for_status never fires), so without this
+        check it gets saved and displayed as if it were a real answer.
+        Detection keys on the answer text literally starting with "Error:" —
+        a real answer never legitimately starts with that, so this is a
+        precise, low-false-positive signal rather than a guess based on
+        confidence/verification being empty (which can also happen for a
+        genuine, if weak, answer).
+        """
+
+        answer = (
+            response.get("answer")
+            or response.get("generated_reply")
+            or response.get("content")
+            or response.get("refined_answer")
+        )
+
+        if isinstance(answer, str) and answer.strip().startswith("Error:"):
+            raise AIResponseException(
+                status_code=502,
+                detail=f"The AI service reported an internal error: {answer.strip()}",
+            )
 
     async def call_provider(
         self,
@@ -1083,6 +1267,8 @@ class ChatService:
         file_bytes: bytes | None = None,
         filename: str | None = None,
         content_type: str | None = None,
+        force_async: bool = False,
+        force_sync: bool = False,
     ):
         """
         Dispatch a multipart request to the existing AIService — the
@@ -1117,6 +1303,8 @@ class ChatService:
             return await self.ai_service.generate_notice_reply(data=data, files=files)
 
         if provider == "summarizer" and tool == "summarize":
-            return await self.ai_service.summarize_document(data=data, files=files)
+            return await self.ai_service.summarize_document(
+                data=data, files=files, force_async=force_async, force_sync=force_sync
+            )
 
         raise ValueError(f"Unsupported upload provider/tool: {provider}/{tool}")

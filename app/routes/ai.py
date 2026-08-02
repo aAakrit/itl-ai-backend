@@ -669,16 +669,23 @@ async def summarize_document(
     module_id: str = Form("gst"),
     user_instructions: str = Form(""),
     output_format: str | None = Form(None),
+    force_async: bool = Form(False),
+    force_sync: bool = Form(False),
     file: UploadFile | None = File(None),
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
     # Vendor's two real endpoints (confirmed against actual FastAPI source):
     # POST /api/summarize/text (JSON — SummarizeTextRequest: document_text
-    # required, min 50 / max 200000 chars) and POST /api/summarize/file
-    # (multipart — no document_text field at all, text is extracted from
-    # the file). Neither streams SSE — a prior doc claimed otherwise; the
-    # actual source code overrides that.
+    # required, min 50 / max 2,000,000 chars — raised from 200K) and
+    # POST /api/summarize/file (multipart — no document_text field at all,
+    # text is extracted from the file). Neither streams SSE — a prior doc
+    # claimed otherwise; the actual source code overrides that.
+    #
+    # /file now branches on size: small docs return the full result inline
+    # (mode: "sync"); large docs return a background job (mode: "async") —
+    # force_async/force_sync map directly to the vendor's own query params
+    # on that endpoint and are ignored for /text (always synchronous).
     if not query.strip() and not file:
         raise HTTPException(
             status_code=422,
@@ -718,11 +725,56 @@ async def summarize_document(
         conversation_id=conversation_id,
         file=file,
         extra_fields=extra_fields,
+        force_async=force_async,
+        force_sync=force_sync,
     )
 
     return success_response(
         data=result,
         message="Document summarized successfully.",
+    )
+
+
+@router.get(
+    "/summarize/status/{job_id}",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Summarize Job Status",
+    description="Poll the status of a background Summarizer job (large documents).",
+)
+async def get_summarize_job_status(
+    job_id: str,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.get_job_status(current_user.id, job_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    return success_response(data=result, message="Job status retrieved.")
+
+
+@router.get(
+    "/summarize/result/{job_id}",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Summarize Job Result",
+    description="Fetch a background Summarizer job's result once done — saves it to the conversation the first time it's called.",
+)
+async def get_summarize_job_result(
+    job_id: str,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.finalize_job(current_user.id, job_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    return success_response(
+        data=result,
+        message="Job result retrieved." if result.get("ready") else "Job still processing.",
     )
 
 

@@ -329,6 +329,14 @@ class AIMessage(Base):
     attachment_size = Column(Integer, nullable=True)
     attachment_path = Column(String(500), nullable=True)
 
+    # Set when the vendor processes this asynchronously (Summarizer's new
+    # large-document job flow — POST /api/summarize/file returns HTTP 202
+    # + job_id instead of the result). While set and `status == "processing"`,
+    # the message has no answer yet; the frontend polls
+    # GET /ai/summarize/status/{job_id} and finalizes via
+    # GET /ai/summarize/result/{job_id}, which fills in the real answer.
+    provider_job_id = Column(String(100), nullable=True, index=True)
+
     # ------------------------------------------------------------------
     # Structured Response
     # ------------------------------------------------------------------
