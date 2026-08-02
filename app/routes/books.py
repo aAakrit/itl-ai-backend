@@ -3,9 +3,8 @@ from uuid import UUID
 
 from app.schemas.book_content import BookContentCreate, BookContentUpdate
 from app.schemas.book_section import BookSectionCreate, BookSectionUpdate
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, File, UploadFile
 from sqlalchemy.orm import Session
-
 from app.db import SessionLocal
 from app.models.user import User
 from app.routes.auth import require_admin
@@ -422,4 +421,14 @@ def increment_view(
     return BookContentService.increment_view_count(
         db=db,
         content_id=content_id,
+    )
+
+@router.post("/contents/import")
+async def import_content(
+    file: UploadFile = File(...),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return await BookContentService.import_document(
+        file=file,
     )

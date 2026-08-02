@@ -4,6 +4,15 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
+import os
+import tempfile
+from pathlib import Path
+
+import fitz
+import mammoth
+from bs4 import BeautifulSoup
+from fastapi import UploadFile
+
 from app.models.book import Book
 from app.models.book_content import BookContent
 from app.models.book_section import BookSection
@@ -285,3 +294,152 @@ class BookContentService:
             )
             .all()
         )
+
+@staticmethod
+async def import_document(
+    file: UploadFile,
+):
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No file uploaded.",
+        )
+
+    extension = Path(file.filename).suffix.lower()
+
+    if extension not in {".pdf", ".docx"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF and DOCX files are supported.",
+        )
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=extension,
+    ) as temp:
+
+        temp.write(await file.read())
+        temp_path = temp.name
+
+    try:
+
+        if extension == ".docx":
+            return BookContentService._import_docx(
+                temp_path,
+                file.filename,
+            )
+
+        return BookContentService._import_pdf(
+            temp_path,
+            file.filename,
+        )
+
+    finally:
+
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+@staticmethod
+def _import_docx(
+    path: str,
+    filename: str,
+):
+
+    with open(path, "rb") as document:
+
+        result = mammoth.convert_to_html(document)
+
+    html = result.value
+
+    plain_text = BookContentService._html_to_text(html)
+
+    return {
+        "title": BookContentService._extract_title(
+            plain_text,
+            filename,
+        ),
+        "html_content": html,
+        "plain_text": plain_text,
+        "word_count": len(plain_text.split()),
+        "page_count": None,
+        "file_name": filename,
+        "file_type": "docx",
+    }
+
+@staticmethod
+def _import_pdf(
+    path: str,
+    filename: str,
+):
+
+    document = fitz.open(path)
+
+    pages = []
+
+    for page in document:
+        pages.append(page.get_text("text"))
+
+    plain_text = "\n\n".join(pages)
+
+    html = BookContentService._text_to_html(
+        plain_text,
+    )
+
+    return {
+        "title": BookContentService._extract_title(
+            plain_text,
+            filename,
+        ),
+        "html_content": html,
+        "plain_text": plain_text,
+        "word_count": len(plain_text.split()),
+        "page_count": len(document),
+        "file_name": filename,
+        "file_type": "pdf",
+    }
+
+@staticmethod
+def _html_to_text(
+    html: str,
+) -> str:
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser",
+    )
+
+    return soup.get_text(
+        separator="\n",
+        strip=True,
+    )
+
+@staticmethod
+def _text_to_html(
+    text: str,
+) -> str:
+
+    paragraphs = []
+
+    for line in text.splitlines():
+
+        line = line.strip()
+
+        if line:
+            paragraphs.append(f"<p>{line}</p>")
+
+    return "\n".join(paragraphs)
+
+@staticmethod
+def _extract_title(
+    text: str,
+    filename: str,
+) -> str:
+
+    for line in text.splitlines():
+
+        line = line.strip()
+
+        if line:
+            return line[:500]
+
+    return Path(filename).stem
