@@ -245,18 +245,97 @@ class ChatService:
         """
         Different vendor tools return meaningfully different shapes:
           - chat / refine-ish tools: {"answer": "...", "sources": [...]}
+          - Case Law Research (premium/search): NO "sources" field at all —
+            this is why sources never showed for it. Instead it returns
+            FOUR separate arrays (results, enhanced_related, statute_results,
+            acts_rules_results), confirmed against the vendor's full API
+            contract. Mapped here: results + statute_results +
+            acts_rules_results -> sources (everything the memo actually
+            cites), enhanced_related -> related_judgements (the sidebar).
           - case-laws bridge: {"results": [...]} — no `answer` field at all.
-          - notice / summarize: shape is NOT fully confirmed. We have the
-            vendor's actual route/request code (endpoints, Pydantic models)
-            but not the body of run_notice_pipeline()/run_summarizer_pipeline()
-            that builds the response, so the exact output key names are a
-            best-effort guess with a defensive fallback chain — verify
-            against a live response and tighten this once confirmed.
+          - notice / summarize: best-effort field guessing, see below.
         `save_ai_message` (and everything downstream: serialize_message,
-        the frontend) expects a single normalized {"answer", "sources"}
-        shape, so tool-specific responses are mapped to it here rather than
-        leaking vendor-specific shapes into message storage.
+        the frontend) expects a single normalized {"answer", "sources",
+        "related_judgements"} shape, so tool-specific responses are mapped
+        to it here rather than leaking vendor-specific shapes into message
+        storage. Verification/citation_audit details are deliberately left
+        out of this normalized shape — they're an internal accuracy signal,
+        not something to surface to end users.
         """
+
+        if tool == "search":
+            def judgement_source(card: dict) -> dict:
+                return {
+                    "id": card.get("id"),
+                    "document_type": "judgement",
+                    "reference": card.get("citation"),
+                    "heading": card.get("partyname"),
+                    "court": card.get("court"),
+                    "court_name": card.get("court_name"),
+                    "citation": card.get("citation"),
+                    "similarity": card.get("similarity_score"),
+                    "link": card.get("link"),
+                }
+
+            def statute_source(card: dict) -> dict:
+                return {
+                    "id": card.get("id"),
+                    "document_type": "statute",
+                    "reference": card.get("reference"),
+                    "heading": card.get("heading"),
+                    "similarity": card.get("similarity_score"),
+                    "link": card.get("link"),
+                }
+
+            def act_rule_source(card: dict) -> dict:
+                return {
+                    "id": card.get("id"),
+                    "document_type": card.get("document_type", "act"),
+                    "reference": card.get("reference"),
+                    "heading": card.get("heading"),
+                    "similarity": card.get("similarity_score"),
+                    "link": card.get("link"),
+                }
+
+            sources = (
+                [judgement_source(c) for c in response.get("results") or []]
+                + [statute_source(c) for c in response.get("statute_results") or []]
+                + [act_rule_source(c) for c in response.get("acts_rules_results") or []]
+            )
+
+            related_judgements = [
+                {
+                    "id": c.get("id"),
+                    "partyname": c.get("partyname"),
+                    "court": c.get("court") or c.get("court_name"),
+                    "citation": c.get("citation"),
+                    "facts": c.get("facts"),
+                    "issue": c.get("issue"),
+                    "held": c.get("held"),
+                    "ratio": c.get("ratio"),
+                    "link": c.get("link"),
+                }
+                for c in response.get("enhanced_related") or []
+            ]
+
+            answer = response.get("answer")
+
+            if response.get("needs_clarification") and not answer:
+                # Case Law Research's clarification branch has an empty
+                # `answer` and puts the question in separate fields instead
+                # (unlike the Ask Bot, which puts the question text directly
+                # in `answer`) — synthesize a displayable answer so this
+                # doesn't render as a blank bubble.
+                question = response.get("clarifying_question", "")
+                missing = response.get("missing_facts") or []
+                answer = question + (f"\n\nMissing details: {', '.join(missing)}" if missing else "")
+
+            return {
+                **response,
+                "answer": answer,
+                "sources": sources,
+                "related_judgements": related_judgements,
+            }
 
         if tool in ("process", "summarize"):
             answer = (
@@ -681,7 +760,6 @@ class ChatService:
             "message_type": message.message_type,
             "status": message.status,
             "content": message.query if is_user else message.answer,
-            "confidence": message.confidence,
             "query_time_ms": message.query_time_ms,
             "sources": message.sources,
             "related_judgements": message.related_judgements,
@@ -794,9 +872,22 @@ class ChatService:
                     "session_id": conversation.id,
                     "message_id": user_message.id,
                 }
+            elif provider == "premium" and tool == "search":
+                # Confirmed against the vendor's full API contract for
+                # /api/judgements/premium/search. Deliberately NOT the same
+                # shape as chat: this service is explicitly stateless
+                # ("No session_id here... each research request is
+                # standalone" — vendor's own words) — sending session_id/
+                # session_token here would be wrong, not just unnecessary.
+                # facts/court_area/max_rounds/skip_clarification are real,
+                # optional fields we don't collect from the UI yet.
+                provider_payload = {
+                    "query": query,
+                    "max_results": min(max_results, 200),
+                }
             else:
-                # main/chat, premium/search, premium/clarify, premium/refine —
-                # all confirmed to share this same base shape plus session_id.
+                # main/chat, premium/clarify, premium/refine — all confirmed
+                # to share this same base shape plus session_id.
                 provider_payload = {
                     "query": query,
                     "max_results": max_results,
@@ -804,12 +895,12 @@ class ChatService:
                     "message_id": user_message.id,
                 }
 
-            if provider_session.provider_session_token:
+            if provider_session.provider_session_token and not (provider == "premium" and tool == "search"):
                 # Real vendor session token (see get_or_create_provider_session)
                 # — this is what actually gives the vendor bot memory of prior
                 # turns, as opposed to session_id (our own conversation id,
                 # which the vendor doc's v2 contract wants alongside it, not
-                # instead of it).
+                # instead of it). Excluded for premium/search — see above.
                 provider_payload["session_token"] = provider_session.provider_session_token
 
             # ---------------------------------------------------------
@@ -878,12 +969,11 @@ class ChatService:
                 "assistant_message": {
                     "id": assistant_message.id,
                     "answer": assistant_message.answer,
-                    "confidence": assistant_message.confidence,
                     "query_time_ms": assistant_message.query_time_ms,
                     "sources": assistant_message.sources,
                     "related_judgements": assistant_message.related_judgements,
-                    "verification": assistant_message.verification,
-                    "pipeline": assistant_message.pipeline,
+                    "needs_clarification": assistant_message.needs_clarification,
+                    "deep_research_used": assistant_message.deep_research_used,
                     "created_at": assistant_message.created_at,
                 },
             }
