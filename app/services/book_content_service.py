@@ -12,6 +12,8 @@ import fitz
 import mammoth
 from bs4 import BeautifulSoup
 from fastapi import UploadFile
+from PIL import Image
+import io
 
 from app.models.book import Book
 from app.models.book_content import BookContent
@@ -377,7 +379,12 @@ class BookContentService:
         pages = []
 
         for page in document:
-            pages.append(page.get_text("text"))
+
+            text = page.get_text("text")
+            if len(text.strip()) < 20:
+                text = BookContentService._ocr_page(page)
+
+            pages.append(text)
 
         plain_text = "\n\n".join(pages)
 
@@ -398,6 +405,29 @@ class BookContentService:
             "file_type": "pdf",
         }
 
+    @staticmethod
+    def _ocr_page(
+        page,
+        zoom: float = 2.5,
+    ) -> str:
+        """
+        Renders a PDF page to an image and runs OCR on it.
+        Used as a fallback for scanned pages that have no text layer.
+        """
+
+        matrix = fitz.Matrix(zoom, zoom)
+
+        pixmap = page.get_pixmap(matrix=matrix)
+
+        image = Image.open(
+            io.BytesIO(pixmap.tobytes("png"))
+        )
+
+        try:
+            return pytesseract.image_to_string(image)
+        except Exception:
+            return ""
+    
     @staticmethod
     def _html_to_text(
         html: str,

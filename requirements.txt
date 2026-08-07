@@ -16,3 +16,5 @@ httpx>=0.28.0
 mammoth
 pymupdf
 beautifulsoup4
+pytesseract
+Pillow
