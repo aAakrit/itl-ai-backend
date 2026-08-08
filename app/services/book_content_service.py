@@ -381,11 +381,7 @@ class BookContentService:
 
         for page in document:
 
-            text = (
-                page.get_text("text")
-                or page.get_text("blocks")
-                or page.get_text("words")
-            )
+            text = page.get_text("text")
             if len(text.strip()) < 20:
                 text = BookContentService._ocr_page(page)
 
