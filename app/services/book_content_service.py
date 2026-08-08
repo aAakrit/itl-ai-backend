@@ -10,6 +10,7 @@ from pathlib import Path
 
 import fitz
 import mammoth
+import pytesseract
 from bs4 import BeautifulSoup
 from fastapi import UploadFile
 from PIL import Image
@@ -380,7 +381,11 @@ class BookContentService:
 
         for page in document:
 
-            text = page.get_text("text")
+            text = (
+                page.get_text("text")
+                or page.get_text("blocks")
+                or page.get_text("words")
+            )
             if len(text.strip()) < 20:
                 text = BookContentService._ocr_page(page)
 
@@ -424,9 +429,12 @@ class BookContentService:
         )
 
         try:
-            return pytesseract.image_to_string(image)
-        except Exception:
-            return ""
+            text = pytesseract.image_to_string(image, lang="eng")
+            print("OCR words:", len(text.split()))
+            return text
+        except Exception as e:
+            print("OCR ERROR:", e)
+            raise
     
     @staticmethod
     def _html_to_text(
