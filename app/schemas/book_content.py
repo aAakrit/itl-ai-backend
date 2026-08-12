@@ -32,6 +32,16 @@ class BookContentBase(BaseModel):
         max_length=255,
     )
 
+    attachment_path: Optional[str] = None
+
+    attachment_filename: Optional[str] = None
+
+    attachment_content_type: Optional[str] = None
+
+    attachment_size: Optional[int] = None
+
+    page_count: Optional[int] = None
+    
     summary: Optional[str] = None
 
     keywords: List[str] = []

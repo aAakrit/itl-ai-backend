@@ -3,7 +3,8 @@ from uuid import UUID
 
 from app.schemas.book_content import BookContentCreate, BookContentUpdate
 from app.schemas.book_section import BookSectionCreate, BookSectionUpdate
-from fastapi import APIRouter, Depends, Query, File, UploadFile
+from app.utils.storage import read_file
+from fastapi import APIRouter, Depends, Query, File, UploadFile, Response, HTTPException
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.models.user import User
@@ -431,4 +432,33 @@ async def import_content(
 ):
     return await BookContentService.import_document(
         file=file,
+    )
+
+@router.get("/contents/{content_id}/pdf")
+def get_content_pdf(
+    content_id: UUID,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+
+    content = BookContentService.get(
+        db,
+        content_id,
+    )
+
+    if not content.attachment_path:
+        raise HTTPException(
+            status_code=404,
+            detail="No document found.",
+        )
+
+    data = read_file(content.attachment_path)
+
+    return Response(
+        content=data,
+        media_type=content.attachment_content_type,
+        headers={
+            "Content-Disposition":
+                f'inline; filename="{content.attachment_filename}"'
+        },
     )

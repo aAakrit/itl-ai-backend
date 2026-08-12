@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+from sqlalchemy import BigInteger
 from sqlalchemy import Column
 from sqlalchemy import DateTime
 from sqlalchemy import ForeignKey
@@ -82,6 +83,37 @@ class BookContent(Base):
         nullable=False,
     )
 
+    # =====================================================
+    # Original Uploaded Document
+    # =====================================================
+
+    document_path = Column(
+        String(255),
+        nullable=True,
+    )
+
+    document_filename = Column(
+        String(500),
+        nullable=True,
+    )
+
+    document_content_type = Column(
+        String(100),
+        nullable=True,
+    )
+
+    document_size = Column(
+        BigInteger,
+        nullable=True,
+    )
+
+    page_count = Column(
+        Integer,
+        nullable=True,
+    )
+
+    # =====================================================
+
     status = Column(
         String(20),
         nullable=False,
@@ -120,9 +152,9 @@ class BookContent(Base):
         nullable=False,
     )
 
-    # -----------------------------------
+    # -----------------------------------------------------
     # Relationships
-    # -----------------------------------
+    # -----------------------------------------------------
 
     book = relationship(
         "Book",

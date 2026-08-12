@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from app.utils.storage import save_file
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
@@ -299,12 +300,11 @@ class BookContentService:
         )
 
     @staticmethod
-    async def import_document(
-        file: UploadFile,
-    ):
+    async def import_document(file: UploadFile):
+
         if not file.filename:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="No file uploaded.",
             )
 
@@ -312,36 +312,55 @@ class BookContentService:
 
         if extension not in {".pdf", ".docx"}:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="Only PDF and DOCX files are supported.",
             )
+
+        file_bytes = await file.read()
+
+        # save original document
+        stored_name = save_file(
+            file_bytes,
+            file.filename,
+        )
 
         with tempfile.NamedTemporaryFile(
             delete=False,
             suffix=extension,
         ) as temp:
 
-            temp.write(await file.read())
+            temp.write(file_bytes)
             temp_path = temp.name
 
         try:
 
             if extension == ".docx":
-                return BookContentService._import_docx(
+                data = BookContentService._import_docx(
+                    temp_path,
+                    file.filename,
+                )
+            else:
+                data = BookContentService._import_pdf(
                     temp_path,
                     file.filename,
                 )
 
-            return BookContentService._import_pdf(
-                temp_path,
-                file.filename,
+            data.update(
+                {
+                    "attachment_path": stored_name,
+                    "attachment_filename": file.filename,
+                    "attachment_content_type": file.content_type,
+                    "attachment_size": len(file_bytes),
+                }
             )
+
+            return data
 
         finally:
 
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-
+                
     @staticmethod
     def _import_docx(
         path: str,
