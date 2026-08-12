@@ -340,10 +340,14 @@ class BookContentService:
                     file.filename,
                 )
             else:
-                data = BookContentService._import_pdf(
-                    temp_path,
-                    file.filename,
-                )
+                data = {
+                    "title": Path(file.filename).stem,
+                    "html_content": "",
+                    "plain_text": "",
+                    "page_count": None,
+                    "file_name": file.filename,
+                    "file_type": "pdf",
+                }
 
             data.update(
                 {
