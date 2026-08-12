@@ -1,10 +1,11 @@
 from typing import Optional
 from uuid import UUID
 
+from app.models.book_content import BookContent
 from app.schemas.book_content import BookContentCreate, BookContentUpdate
 from app.schemas.book_section import BookSectionCreate, BookSectionUpdate
 from app.utils.storage import read_file
-from fastapi import APIRouter, Depends, Query, File, UploadFile, Response, HTTPException
+from fastapi import APIRouter, Depends, Query, File, UploadFile, Response, HTTPException, status
 from sqlalchemy.orm import Session
 from app.db import SessionLocal
 from app.models.user import User
@@ -192,32 +193,56 @@ async def import_content(
 @router.get("/contents/{content_id}/pdf")
 def get_content_pdf(
     content_id: UUID,
-    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
+    content = db.get(BookContent, content_id)
 
-    content = BookContentService.get(
-        db,
-        content_id,
-    )
-
-    if not content.attachment_path:
+    if not content:
         raise HTTPException(
-            status_code=404,
-            detail="No document found.",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Content not found.",
         )
 
-    data = read_file(content.attachment_path)
+    # --------------------------------------------------
+    # Check stored document
+    # --------------------------------------------------
+
+    if not content.document_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No original document is attached to this content.",
+        )
+
+    # --------------------------------------------------
+    # Read PDF from local storage
+    # --------------------------------------------------
+
+    try:
+        data = read_file(content.document_path)
+
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original document file not found on server.",
+        )
+
+    # --------------------------------------------------
+    # Return inline so browser/PDF viewer can display it
+    # --------------------------------------------------
 
     return Response(
         content=data,
-        media_type=content.attachment_content_type,
+        media_type=(
+            content.document_content_type
+            or "application/pdf"
+        ),
         headers={
-            "Content-Disposition":
-                f'inline; filename="{content.attachment_filename}"'
+            "Content-Disposition": (
+                f'inline; filename="{content.document_filename or "document.pdf"}"'
+            )
         },
     )
-
 
 # ==================================================================
 #
