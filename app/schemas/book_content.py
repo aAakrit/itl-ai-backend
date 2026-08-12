@@ -32,23 +32,13 @@ class BookContentBase(BaseModel):
         max_length=255,
     )
 
-    attachment_path: Optional[str] = None
-
-    attachment_filename: Optional[str] = None
-
-    attachment_content_type: Optional[str] = None
-
-    attachment_size: Optional[int] = None
-
-    page_count: Optional[int] = None
-    
     summary: Optional[str] = None
 
     keywords: List[str] = []
 
-    html_content: str
+    html_content: str = ""
 
-    plain_text: str
+    plain_text: str = ""
 
     status: str = "DRAFT"
 
@@ -56,7 +46,19 @@ class BookContentBase(BaseModel):
 
     sort_order: int = 0
 
+    # ==================================================
+    # Original Uploaded Document
+    # ==================================================
 
+    document_path: Optional[str] = None
+
+    document_filename: Optional[str] = None
+
+    document_content_type: Optional[str] = None
+
+    document_size: Optional[int] = None
+
+    page_count: Optional[int] = None
 # --------------------------------------------------
 # Create
 # --------------------------------------------------
@@ -102,6 +104,19 @@ class BookContentUpdate(BaseModel):
 
     sort_order: Optional[int] = None
 
+    # ==================================================
+    # Original Uploaded Document
+    # ==================================================
+
+    document_path: Optional[str] = None
+
+    document_filename: Optional[str] = None
+
+    document_content_type: Optional[str] = None
+
+    document_size: Optional[int] = None
+
+    page_count: Optional[int] = None
 
 # --------------------------------------------------
 # Response
