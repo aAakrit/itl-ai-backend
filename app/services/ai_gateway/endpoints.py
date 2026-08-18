@@ -53,6 +53,13 @@ class NoticeEndpoints:
     TYPES = "/api/notice/types"
     HEALTH = "/api/health"
 
+    SESSIONS = "/api/v2/sessions"
+    ANALYZE_TEXT = "/api/notice/analyze"
+    ANALYZE_FILE = "/api/notice/analyze-file"
+    DRAFT = "/api/notice/draft"
+    REFINE = "/api/notice/refine"
+    ASK = "/api/notice/ask"
+
 
 class SummarizerEndpoints:
     SUMMARIZE_TEXT = "/api/summarize/text"

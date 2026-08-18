@@ -10,7 +10,7 @@ from datetime import datetime
 
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
-from app.services.chat import ChatService
+from app.services.chat import ChatService, NoticeStageError
 from app.utils.chat import get_chat_service
 from fastapi import (
     APIRouter,
@@ -22,6 +22,7 @@ from fastapi import (
     status,
 )
 from fastapi import Depends
+from fastapi.responses import JSONResponse
 from app.utils import storage
 from app.schemas.ai import (
     AIQueryRequest,
@@ -33,6 +34,9 @@ from app.schemas.ai import (
     JudgmentSearchRequest,
     MessageFeedbackRequest,
     MessageRefineRequest,
+    NoticeAskRequest,
+    NoticeDraftRequest,
+    NoticeRefineRequest,
     RefineRequest,
     SessionCreateRequest,
     SimilarRequest,
@@ -648,6 +652,180 @@ async def list_notice_types(current_user: User = Depends(get_current_user)):
     return success_response(
         data=result,
         message="Notice types retrieved successfully.",
+    )
+
+
+# -----------------------------------------------------------------------
+# Notice Reply AI — staged conversational workflow (Aug 2026 contract)
+#
+# uploaded -> analysed -> (awaiting_inputs) -> drafted -> refined
+#
+# Analysis always precedes drafting; the vendor (and, redundantly, this
+# app) refuses to draft before a successful analyze in the same
+# conversation. /notice/generate above is the legacy one-shot path and is
+# untouched by any of this.
+# -----------------------------------------------------------------------
+
+
+@router.post(
+    "/notice/analyze",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Analyze Notice (Text)",
+    description="Stage 1 — analyse pasted/typed notice text into a summary and detected allegations.",
+)
+async def analyze_notice(
+    notice_text: str = Form(..., min_length=1, max_length=50000),
+    conversation_id: int | None = Form(None),
+    module_id: str = Form("gst"),
+    user_name: str | None = Form(None),
+    business_name: str | None = Form(None),
+    gstin: str | None = Form(None),
+    address: str | None = Form(None),
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    result = await chat.analyze_notice(
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        module=module_id,
+        notice_text=notice_text,
+        user_name=user_name or current_user.name or "",
+        business_name=business_name or current_user.firm or "",
+        gstin=gstin or "",
+        address=address or current_user.address or "",
+    )
+
+    return success_response(
+        data=result,
+        message="Notice analysed successfully.",
+    )
+
+
+@router.post(
+    "/notice/analyze-file",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Analyze Notice (File)",
+    description="Stage 1 — analyse an uploaded notice document (PDF/DOCX/TXT/scanned image PDF).",
+)
+async def analyze_notice_file(
+    file: UploadFile = File(...),
+    conversation_id: int | None = Form(None),
+    module_id: str = Form("gst"),
+    user_name: str | None = Form(None),
+    business_name: str | None = Form(None),
+    gstin: str | None = Form(None),
+    address: str | None = Form(None),
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    if file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_DOCUMENT_EXTENSIONS and ext != ".pdf":
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Use PDF, DOCX, or TXT.")
+
+    result = await chat.analyze_notice(
+        user_id=current_user.id,
+        conversation_id=conversation_id,
+        module=module_id,
+        file=file,
+        user_name=user_name or current_user.name or "",
+        business_name=business_name or current_user.firm or "",
+        gstin=gstin or "",
+        address=address or current_user.address or "",
+    )
+
+    return success_response(
+        data=result,
+        message="Notice analysed successfully.",
+    )
+
+
+@router.post(
+    "/notice/draft",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Draft Notice Reply",
+    description="Stage 2 — draft the reply. `user_inputs` may be omitted entirely (draft now, from the notice alone).",
+)
+async def draft_notice(
+    request: NoticeDraftRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.draft_notice(
+            user_id=current_user.id,
+            conversation_id=request.conversation_id,
+            user_inputs=request.user_inputs.dict(exclude_none=True) if request.user_inputs else None,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    except NoticeStageError as exc:
+        return JSONResponse(status_code=409, content=exc.detail)
+
+    return success_response(
+        data=result,
+        message="Notice reply drafted successfully.",
+    )
+
+
+@router.post(
+    "/notice/refine",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Refine Notice Reply",
+    description="Stage 3 — refine the current draft by free-text instruction. Repeatable; increments revision.",
+)
+async def refine_notice(
+    request: NoticeRefineRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.refine_notice(
+            user_id=current_user.id,
+            conversation_id=request.conversation_id,
+            instruction=request.instruction,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    except NoticeStageError as exc:
+        return JSONResponse(status_code=409, content=exc.detail)
+
+    return success_response(
+        data=result,
+        message="Notice reply refined successfully.",
+    )
+
+
+@router.post(
+    "/notice/ask",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Ask About Notice",
+    description="Ask a question about the analysed notice without redrafting. Does not change stage.",
+)
+async def ask_notice(
+    request: NoticeAskRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.ask_notice(
+            user_id=current_user.id,
+            conversation_id=request.conversation_id,
+            question=request.question,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    except NoticeStageError as exc:
+        return JSONResponse(status_code=409, content=exc.detail)
+
+    return success_response(
+        data=result,
+        message="Question answered successfully.",
     )
 
 

@@ -173,6 +173,86 @@ class MessageRefineRequest(BaseModel):
 
 
 # =============================================================================
+# Notice Reply AI — staged conversational workflow
+# =============================================================================
+
+class NoticeAnalyzeRequest(BaseModel):
+    """
+    Stage 1 (pasted/typed) — POST /api/notice/analyze. Vendor's
+    notice_text is required, ≤50000 chars; user_name/business_name/gstin/
+    address are optional context the vendor uses for tailoring the reply,
+    never guessed if absent.
+    """
+
+    conversation_id: int | None = None
+
+    module_id: str = "gst"
+
+    notice_text: str = Field(..., min_length=1, max_length=50000)
+
+    user_name: str | None = None
+    business_name: str | None = None
+    gstin: str | None = None
+    address: str | None = None
+
+
+class NoticePerAllegationInput(BaseModel):
+    allegation_no: int
+    response: str | None = None
+
+
+class NoticeUserInputs(BaseModel):
+    """
+    All fields optional — an empty/omitted body is the "draft now, based
+    only on the uploaded notice" path (§B3). Never required to unblock
+    drafting.
+    """
+
+    brief_facts: str | None = None
+    explanation: str | None = None
+    legal_grounds: str | None = None
+    supporting_documents: list[str] | None = None
+    additional_info: str | None = None
+    per_allegation: list[NoticePerAllegationInput] | None = None
+
+
+class NoticeDraftRequest(BaseModel):
+    """
+    Stage 2 — POST /api/notice/draft. `analysis_id` is intentionally NOT
+    accepted here: it's looked up server-side from the notice's stored
+    session state, matching the vendor's "you do not re-send them" note
+    in §B3 and preventing a client from drafting against a stale/foreign
+    analysis_id.
+    """
+
+    conversation_id: int
+
+    user_inputs: NoticeUserInputs | None = None
+
+
+class NoticeRefineRequest(BaseModel):
+    """
+    Stage 3 — POST /api/notice/refine. Repeatable; `draft_id` is likewise
+    looked up server-side (always refines the latest revision).
+    """
+
+    conversation_id: int
+
+    instruction: str = Field(..., min_length=1, max_length=2000)
+
+
+class NoticeAskRequest(BaseModel):
+    """
+    §B5 — POST /api/notice/ask. Mid-conversation question that doesn't
+    change stage or touch the current draft.
+    """
+
+    conversation_id: int
+
+    question: str = Field(..., min_length=1, max_length=2000)
+
+
+# =============================================================================
 # Generic Response
 # =============================================================================
 

@@ -108,6 +108,32 @@ class AIService:
     async def get_notice_types(self) -> dict:
         return await self.notice.get_notice_types()
 
+    # ------------------------------------------------------------------
+    # Notice Reply AI — staged conversational workflow
+    # ------------------------------------------------------------------
+
+    async def notice_create_session(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.create_session(payload)
+
+    async def notice_analyze(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.analyze(payload)
+
+    async def notice_analyze_file(
+        self,
+        data: dict[str, Any],
+        files: dict[str, Any],
+    ) -> dict:
+        return await self.notice.analyze_file(data, files)
+
+    async def notice_draft(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.draft(payload)
+
+    async def notice_refine(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.refine(payload)
+
+    async def notice_ask(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.ask(payload)
+
     # ========================================================================
     # Document Summarizer
     # ========================================================================
