@@ -22,3 +22,10 @@ AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", 180))
 AI_RENDER_MARKDOWN = (
     os.getenv("AI_RENDER_MARKDOWN", "true").lower() == "true"
 )
+
+# Paytm — credentials only from env, never hardcoded.
+PAYTM_MID = os.getenv("PAYTM_MID", "")
+PAYTM_MERCHANT_KEY = os.getenv("PAYTM_MERCHANT_KEY", "")
+PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE", "WEBSTAGING")
+PAYTM_CALLBACK_URL = os.getenv("PAYTM_CALLBACK_URL", "")
+PAYTM_ENV = os.getenv("PAYTM_ENV", "staging").lower()

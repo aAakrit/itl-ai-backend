@@ -8,6 +8,10 @@ from app.db import Base, engine
 # Import models so SQLAlchemy registers them
 from app.models.user import User
 from app.models.session import AuthSession
+from app.models.subscription import Subscription
+from app.models.payment import Payment
+from app.models.ai_usage import AIUsageLimit
+from app.models.audit_log import AuditLog
 
 # Routes
 from app.routes.auth import router as auth_router
@@ -15,6 +19,7 @@ from app.routes.cms_page import router as cms_page_router
 from app.routes.admin_user import router as admin_user
 from app.routes.books import router as admin_books
 from app.routes.ai import router as ai_router
+from app.routes.subscription import router as admin_subscription_router
 from app.models.ai import (
     AIConversation,
     AIProviderSession,
@@ -76,3 +81,4 @@ app.include_router(cms_page_router)
 app.include_router(admin_user)
 app.include_router(admin_books)
 app.include_router(ai_router)
+app.include_router(admin_subscription_router)
