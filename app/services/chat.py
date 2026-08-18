@@ -1388,6 +1388,16 @@ class ChatService:
         Stage 1 — POST /api/notice/analyze or /api/notice/analyze-file.
         "Analysis always precedes drafting" (§B): this is the only entry
         point that creates a notice conversation's session/stage state.
+
+        Falls back to the legacy one-shot /api/notice/process(-file) if the
+        vendor returns 404 for the staged endpoint — i.e. this vendor
+        deployment doesn't have the Aug 2026 staged workflow live yet. The
+        legacy path analyses AND drafts in one call, so a fallback
+        conversation starts at stage "drafted" rather than "analysed"; it's
+        flagged `legacy: True` in the session metadata so draft_notice/
+        refine_notice/ask_notice (which all depend on vendor-side
+        analysis_id/draft_id that only the staged endpoints mint) can fail
+        with a clear message instead of chasing another 404.
         """
 
         if not (notice_text and notice_text.strip()) and file is None:
@@ -1419,6 +1429,7 @@ class ChatService:
             if provider_session.provider_session_token:
                 session_fields["session_token"] = provider_session.provider_session_token
 
+            file_bytes: Optional[bytes] = None
             if file is not None:
                 file_bytes = await file.read()
                 stored_path = storage.save_file(file_bytes, file.filename or "notice-upload")
@@ -1428,30 +1439,109 @@ class ChatService:
                 user_message.attachment_path = stored_path
                 self.db.flush()
 
-                data = {
-                    **session_fields,
-                    "user_name": user_name or "",
-                    "business_name": business_name or "",
-                    "gstin": gstin or "",
-                    "address": address or "",
-                }
-                response = await self.ai_service.notice_analyze_file(
-                    data=data,
-                    files={"file": (file.filename, file_bytes, file.content_type)},
+            legacy_fallback = False
+            try:
+                if file is not None:
+                    data = {
+                        **session_fields,
+                        "user_name": user_name or "",
+                        "business_name": business_name or "",
+                        "gstin": gstin or "",
+                        "address": address or "",
+                    }
+                    response = await self.ai_service.notice_analyze_file(
+                        data=data,
+                        files={"file": (file.filename, file_bytes, file.content_type)},
+                    )
+                else:
+                    payload = {
+                        **session_fields,
+                        "notice_text": notice_text,
+                        "user_name": user_name or "",
+                        "business_name": business_name or "",
+                        "gstin": gstin or "",
+                        "address": address or "",
+                    }
+                    response = await self.ai_service.notice_analyze(payload)
+            except AIResponseException as exc:
+                if exc.status_code != 404:
+                    raise
+                # This vendor deployment doesn't have /api/notice/analyze(-file)
+                # yet — degrade to the legacy one-shot endpoint rather than
+                # surfacing a raw 404 to the user.
+                logger.warning(
+                    "Staged notice analyze 404'd for conversation %s — falling back to legacy /notice/process%s",
+                    conversation.id,
+                    "-file" if file is not None else "",
                 )
-            else:
-                payload = {
-                    **session_fields,
-                    "notice_text": notice_text,
+                legacy_fallback = True
+                legacy_data = {
                     "user_name": user_name or "",
                     "business_name": business_name or "",
                     "gstin": gstin or "",
                     "address": address or "",
                 }
-                response = await self.ai_service.notice_analyze(payload)
+                if file is not None:
+                    response = await self.ai_service.generate_notice_reply(
+                        data=legacy_data,
+                        files={"file": (file.filename, file_bytes, file.content_type)},
+                    )
+                else:
+                    response = await self.ai_service.generate_notice_reply(
+                        data={**legacy_data, "notice_text": notice_text},
+                    )
 
             self._raise_if_pipeline_error(response)
             self.save_provider_session_token(provider_session=provider_session, response=response)
+
+            if legacy_fallback:
+                normalized = self._normalize_provider_response("process", response)
+
+                self._save_notice_session_metadata(
+                    provider_session,
+                    {"stage": "drafted", "legacy": True},
+                )
+
+                assistant_message = self.save_ai_message(
+                    conversation_id=conversation.id,
+                    provider="notice",
+                    response={
+                        "answer": normalized.get("answer"),
+                        "sources": normalized.get("sources"),
+                        "message_id": response.get("message_id"),
+                    },
+                    parent_message_id=user_message.id,
+                )
+                assistant_message.message_type = "notice_draft"
+                assistant_message.provider_metadata = {"stage": "drafted", "legacy": True}
+
+                self.update_conversation(conversation=conversation, provider="notice")
+                self.db.commit()
+
+                self.db.refresh(conversation)
+                self.db.refresh(user_message)
+                self.db.refresh(assistant_message)
+
+                return {
+                    "conversation": self._conversation_summary(conversation),
+                    "user_message": {
+                        "id": user_message.id,
+                        "query": user_message.query,
+                        "created_at": user_message.created_at,
+                    },
+                    "assistant_message": {
+                        "id": assistant_message.id,
+                        "answer": assistant_message.answer,
+                        "created_at": assistant_message.created_at,
+                    },
+                    # Reported as "drafted" (not "analysed") because the legacy
+                    # endpoint analyses AND drafts in a single call — there is
+                    # no separate analysis stage to stop at.
+                    "stage": "drafted",
+                    "legacy": True,
+                    "sources": normalized.get("sources"),
+                    "query_time_ms": response.get("query_time_ms"),
+                }
 
             self._save_notice_session_metadata(
                 provider_session,
@@ -1532,7 +1622,25 @@ class ChatService:
             if not analysis_id:
                 # Local fast-fail mirroring the vendor's own 409 shape
                 # (§B3) — no need for a round trip to learn what our own
-                # stored stage already tells us.
+                # stored stage already tells us. A conversation started via
+                # the legacy fallback (see analyze_notice) never has an
+                # analysis_id — it went straight to a drafted reply — so
+                # give that its own explanation rather than "must be
+                # analysed", which would be misleading here.
+                if meta.get("legacy"):
+                    raise NoticeStageError(
+                        {
+                            "success": False,
+                            "error": "legacy_mode",
+                            "detail": (
+                                "This conversation's reply was generated by the legacy "
+                                "Notice AI (the staged analyse/draft endpoints aren't "
+                                "available on this deployment yet), so there's no "
+                                "separate analysis step to draft from."
+                            ),
+                            "stage": "drafted",
+                        }
+                    )
                 raise NoticeStageError(
                     {
                         "success": False,
@@ -1655,6 +1763,20 @@ class ChatService:
 
             draft_id = meta.get("draft_id")
             if not draft_id:
+                if meta.get("legacy"):
+                    raise NoticeStageError(
+                        {
+                            "success": False,
+                            "error": "legacy_mode",
+                            "detail": (
+                                "This reply was generated by the legacy Notice AI, which "
+                                "has no staged draft to refine. Ask a follow-up question "
+                                "instead, or start a new notice once the staged endpoints "
+                                "are available on this deployment."
+                            ),
+                            "stage": "drafted",
+                        }
+                    )
                 raise NoticeStageError(
                     {
                         "success": False,
@@ -1775,6 +1897,25 @@ class ChatService:
                         "detail": "The notice must be analysed before it can be asked about.",
                         "next_endpoint": "/api/notice/analyze",
                         "stage": "uploaded",
+                    }
+                )
+
+            if meta.get("legacy"):
+                # /notice/ask is part of the same staged release as
+                # /notice/analyze — if that 404'd for this conversation,
+                # /notice/ask will too. Fail fast with a clear explanation
+                # rather than a second confusing 404 round trip.
+                raise NoticeStageError(
+                    {
+                        "success": False,
+                        "error": "legacy_mode",
+                        "detail": (
+                            "This conversation is running on the legacy Notice AI, which "
+                            "doesn't support grounded follow-up questions. Start a new "
+                            "notice once the staged endpoints are available on this "
+                            "deployment, or ask this in a fresh Ask Bot conversation."
+                        ),
+                        "stage": meta.get("stage"),
                     }
                 )
 
