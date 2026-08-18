@@ -29,6 +29,22 @@ class NoticeStageError(Exception):
         super().__init__(detail.get("detail", "Notice workflow stage error"))
 
 
+class NoticeUnavailableError(Exception):
+    """
+    Raised when the Notice AI vendor could not be reached through EITHER
+    the staged endpoints or the legacy one-shot fallback — i.e. the whole
+    Notice service (at whatever URL AI_NOTICE_URL currently points to)
+    looks unreachable/undeployed, not just the newer staged routes.
+    Caught in routes/ai.py and turned into a clean 503 instead of letting
+    the raw vendor 404 body ("AI Service Error" / "Not Found") reach the
+    person, which reads like our own bug rather than a vendor outage.
+    """
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(detail)
+
+
 class ChatService:
 
     def __init__(self, db):
@@ -1481,15 +1497,37 @@ class ChatService:
                     "gstin": gstin or "",
                     "address": address or "",
                 }
-                if file is not None:
-                    response = await self.ai_service.generate_notice_reply(
-                        data=legacy_data,
-                        files={"file": (file.filename, file_bytes, file.content_type)},
+                try:
+                    if file is not None:
+                        response = await self.ai_service.generate_notice_reply(
+                            data=legacy_data,
+                            files={"file": (file.filename, file_bytes, file.content_type)},
+                        )
+                    else:
+                        response = await self.ai_service.generate_notice_reply(
+                            data={**legacy_data, "notice_text": notice_text},
+                        )
+                except Exception as legacy_exc:
+                    # Both the staged AND the legacy endpoint failed — this
+                    # isn't "the staged workflow isn't deployed yet" anymore,
+                    # it's "the Notice AI service isn't reachable at all" at
+                    # whatever URL AI_NOTICE_URL currently points to. Fail
+                    # with one clear, diagnosable message instead of letting
+                    # the raw vendor error (which looks identical to a bug on
+                    # our end) reach the person.
+                    logger.error(
+                        "Legacy notice fallback ALSO failed for conversation %s "
+                        "(staged endpoint 404'd, then legacy endpoint raised %r) — "
+                        "the Notice AI service looks unreachable at its configured URL.",
+                        conversation.id,
+                        legacy_exc,
+                        exc_info=True,
                     )
-                else:
-                    response = await self.ai_service.generate_notice_reply(
-                        data={**legacy_data, "notice_text": notice_text},
-                    )
+                    raise NoticeUnavailableError(
+                        "The Notice AI service is temporarily unavailable — neither the "
+                        "new nor the legacy endpoint could be reached. Please try again "
+                        "shortly, or contact support if this persists."
+                    ) from legacy_exc
 
             self._raise_if_pipeline_error(response)
             self.save_provider_session_token(provider_session=provider_session, response=response)

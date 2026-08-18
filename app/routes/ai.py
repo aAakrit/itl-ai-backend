@@ -10,7 +10,7 @@ from datetime import datetime
 
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
-from app.services.chat import ChatService, NoticeStageError
+from app.services.chat import ChatService, NoticeStageError, NoticeUnavailableError
 from app.utils.chat import get_chat_service
 from fastapi import (
     APIRouter,
@@ -685,16 +685,22 @@ async def analyze_notice(
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
-    result = await chat.analyze_notice(
-        user_id=current_user.id,
-        conversation_id=conversation_id,
-        module=module_id,
-        notice_text=notice_text,
-        user_name=user_name or current_user.name or "",
-        business_name=business_name or current_user.firm or "",
-        gstin=gstin or "",
-        address=address or current_user.address or "",
-    )
+    try:
+        result = await chat.analyze_notice(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            module=module_id,
+            notice_text=notice_text,
+            user_name=user_name or current_user.name or "",
+            business_name=business_name or current_user.firm or "",
+            gstin=gstin or "",
+            address=address or current_user.address or "",
+        )
+    except NoticeUnavailableError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "notice_unavailable", "detail": exc.detail},
+        )
 
     return success_response(
         data=result,
@@ -725,16 +731,22 @@ async def analyze_notice_file(
         if ext not in ALLOWED_DOCUMENT_EXTENSIONS and ext != ".pdf":
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}. Use PDF, DOCX, or TXT.")
 
-    result = await chat.analyze_notice(
-        user_id=current_user.id,
-        conversation_id=conversation_id,
-        module=module_id,
-        file=file,
-        user_name=user_name or current_user.name or "",
-        business_name=business_name or current_user.firm or "",
-        gstin=gstin or "",
-        address=address or current_user.address or "",
-    )
+    try:
+        result = await chat.analyze_notice(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            module=module_id,
+            file=file,
+            user_name=user_name or current_user.name or "",
+            business_name=business_name or current_user.firm or "",
+            gstin=gstin or "",
+            address=address or current_user.address or "",
+        )
+    except NoticeUnavailableError as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "notice_unavailable", "detail": exc.detail},
+        )
 
     return success_response(
         data=result,
