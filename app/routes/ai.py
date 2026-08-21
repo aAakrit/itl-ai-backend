@@ -807,6 +807,7 @@ async def submit_notice_evidence_file(
     files: list[UploadFile] = File(...),
     conversation_id: int = Form(...),
     note: str | None = Form(None),
+    force_draft: bool = Form(False),
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
@@ -816,6 +817,7 @@ async def submit_notice_evidence_file(
             conversation_id=conversation_id,
             files=files,
             note=note or "",
+            force_draft=force_draft,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Conversation not found.")

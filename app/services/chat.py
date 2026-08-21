@@ -1689,8 +1689,24 @@ class ChatService:
         conversation_id: int,
         files: list,
         note: str = "",
+        force_draft: bool = False,
     ) -> dict:
-        """POST /api/notice/submissions-file — multipart evidence upload, repeatable `files` field."""
+        """
+        POST /api/notice/submissions-file — multipart evidence upload,
+        repeatable `files` field.
+
+        `force_draft`: the vendor only auto-drafts once ITS OWN analysis
+        decides every allegation is addressed — uploading evidence alone
+        doesn't guarantee that. When the person explicitly clicks "Reply"
+        after attaching documents, they mean "generate it now, using the
+        notice plus everything I just gave you" regardless of the
+        vendor's own readiness heuristic. So if force_draft is set and
+        the upload didn't already produce a draft, this chains straight
+        into an explicit POST /api/notice/draft(force=true) in the same
+        call, and that second response becomes the one returned/saved —
+        guaranteeing "attach N documents, click Reply" always yields a
+        reply in one round trip.
+        """
         try:
             conversation = self._get_owned_conversation(user_id, conversation_id)
             provider_session = await self.get_or_create_notice_session(conversation)
@@ -1706,7 +1722,12 @@ class ChatService:
                 })
 
             filenames = ", ".join(f.filename for f in files if getattr(f, "filename", None))
-            display_query = note.strip() if note and note.strip() else f"[Evidence uploaded: {filenames}]"
+            note_text = note.strip() if note and note.strip() else ""
+            display_query = (
+                f"{note_text} [Evidence: {filenames}]" if note_text else f"[Evidence uploaded: {filenames}]"
+            )
+            if force_draft:
+                display_query += " — reply now"
             user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=display_query)
 
             multipart_files = []
@@ -1719,6 +1740,24 @@ class ChatService:
             self._raise_if_pipeline_error(response)
 
             drafted = response.get("phase") == "DRAFTED" or bool(response.get("generated_reply"))
+            accepted_files = response.get("accepted_files")
+            rejected_files = response.get("rejected_files")
+            documents_on_record = response.get("documents_on_record")
+
+            if force_draft and not drafted:
+                # The evidence alone wasn't enough for the vendor's own
+                # readiness check — force it explicitly rather than leave
+                # the person stuck with uploaded documents and no reply.
+                draft_payload = {
+                    "session_id": provider_session.provider_session_token,
+                    "include_din_ground": False,
+                    "extra_instruction": "",
+                    "force": True,
+                }
+                response = await self.ai_service.notice_draft(draft_payload)
+                self._raise_if_pipeline_error(response)
+                drafted = True
+
             answer = response.get("generated_reply") if drafted else response.get("message")
 
             self._save_notice_session_metadata(provider_session, {
@@ -1745,9 +1784,9 @@ class ChatService:
                 conversation=conversation, user_message=user_message,
                 assistant_message=assistant_message, response=response,
             )
-            result["accepted_files"] = response.get("accepted_files")
-            result["rejected_files"] = response.get("rejected_files")
-            result["documents_on_record"] = response.get("documents_on_record")
+            result["accepted_files"] = accepted_files
+            result["rejected_files"] = rejected_files
+            result["documents_on_record"] = documents_on_record
             return result
         except Exception:
             self.db.rollback()
