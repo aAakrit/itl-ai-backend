@@ -173,15 +173,14 @@ class MessageRefineRequest(BaseModel):
 
 
 # =============================================================================
-# Notice Reply AI — staged conversational workflow
+# Notice Reply AI — v3 workflow (analyse -> submissions -> draft -> refine)
 # =============================================================================
 
 class NoticeAnalyzeRequest(BaseModel):
     """
-    Stage 1 (pasted/typed) — POST /api/notice/analyze. Vendor's
-    notice_text is required, ≤50000 chars; user_name/business_name/gstin/
-    address are optional context the vendor uses for tailoring the reply,
-    never guessed if absent.
+    POST /api/notice/analyze. Vendor's notice_text is required, ≤50000
+    chars; user_name/business_name/gstin/address are optional context.
+    Returns allegations + notice profile ONLY — never a draft.
     """
 
     conversation_id: int | None = None
@@ -196,44 +195,40 @@ class NoticeAnalyzeRequest(BaseModel):
     address: str | None = None
 
 
-class NoticePerAllegationInput(BaseModel):
-    allegation_no: int
-    response: str | None = None
-
-
-class NoticeUserInputs(BaseModel):
+class NoticeSubmissionsRequest(BaseModel):
     """
-    All fields optional — an empty/omitted body is the "draft now, based
-    only on the uploaded notice" path (§B3). Never required to unblock
-    drafting.
-    """
-
-    brief_facts: str | None = None
-    explanation: str | None = None
-    legal_grounds: str | None = None
-    supporting_documents: list[str] | None = None
-    additional_info: str | None = None
-    per_allegation: list[NoticePerAllegationInput] | None = None
-
-
-class NoticeDraftRequest(BaseModel):
-    """
-    Stage 2 — POST /api/notice/draft. `analysis_id` is intentionally NOT
-    accepted here: it's looked up server-side from the notice's stored
-    session state, matching the vendor's "you do not re-send them" note
-    in §B3 and preventing a client from drafting against a stale/foreign
-    analysis_id.
+    POST /api/notice/submissions — the facts/evidence loop. `message` is
+    free text: facts, evidence description, an answer to a follow-up
+    question, or a "reply as it is" trigger phrase, which the vendor
+    detects itself and drafts immediately. Auto-drafts once every
+    allegation is answered (or `ready_to_draft` is set).
     """
 
     conversation_id: int
 
-    user_inputs: NoticeUserInputs | None = None
+    message: str = Field(..., min_length=1, max_length=8000)
+    ready_to_draft: bool = False
+
+
+class NoticeDraftRequest(BaseModel):
+    """
+    POST /api/notice/draft — explicit draft trigger. Normally the vendor
+    auto-drafts from submissions() once every allegation is answered;
+    this is for forcing a draft despite open follow-ups, or redrafting
+    with extra instructions / the DIN ground included.
+    """
+
+    conversation_id: int
+
+    include_din_ground: bool = False
+    extra_instruction: str = Field("", max_length=2000)
+    force: bool = False
 
 
 class NoticeRefineRequest(BaseModel):
     """
-    Stage 3 — POST /api/notice/refine. Repeatable; `draft_id` is likewise
-    looked up server-side (always refines the latest revision).
+    POST /api/notice/refine. Repeatable; v3 has no draft_id concept —
+    refine acts on the session's current draft implicitly.
     """
 
     conversation_id: int
@@ -243,8 +238,9 @@ class NoticeRefineRequest(BaseModel):
 
 class NoticeAskRequest(BaseModel):
     """
-    §B5 — POST /api/notice/ask. Mid-conversation question that doesn't
-    change stage or touch the current draft.
+    COMPATIBILITY endpoint only — v3 has no standalone /api/notice/ask.
+    Dispatches server-side to submissions() or refine() depending on the
+    conversation's current phase.
     """
 
     conversation_id: int

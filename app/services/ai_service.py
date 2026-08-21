@@ -109,7 +109,7 @@ class AIService:
         return await self.notice.get_notice_types()
 
     # ------------------------------------------------------------------
-    # Notice Reply AI — staged conversational workflow
+    # Notice Reply AI — v3 staged workflow (analyse -> submissions -> draft -> refine)
     # ------------------------------------------------------------------
 
     async def notice_create_session(self, payload: dict[str, Any]) -> dict:
@@ -125,14 +125,27 @@ class AIService:
     ) -> dict:
         return await self.notice.analyze_file(data, files)
 
+    async def notice_submissions(self, payload: dict[str, Any]) -> dict:
+        return await self.notice.submissions(payload)
+
+    async def notice_submissions_file(
+        self,
+        data: dict[str, Any],
+        files: list,
+    ) -> dict:
+        return await self.notice.submissions_file(data, files)
+
     async def notice_draft(self, payload: dict[str, Any]) -> dict:
         return await self.notice.draft(payload)
 
     async def notice_refine(self, payload: dict[str, Any]) -> dict:
         return await self.notice.refine(payload)
 
-    async def notice_ask(self, payload: dict[str, Any]) -> dict:
-        return await self.notice.ask(payload)
+    async def notice_session_status(self, session_id: str) -> dict:
+        return await self.notice.session_status(session_id)
+
+    async def notice_supported_formats(self) -> dict:
+        return await self.notice.supported_formats()
 
     # ========================================================================
     # Document Summarizer

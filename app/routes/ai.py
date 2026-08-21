@@ -37,6 +37,7 @@ from app.schemas.ai import (
     NoticeAskRequest,
     NoticeDraftRequest,
     NoticeRefineRequest,
+    NoticeSubmissionsRequest,
     RefineRequest,
     SessionCreateRequest,
     SimilarRequest,
@@ -656,14 +657,22 @@ async def list_notice_types(current_user: User = Depends(get_current_user)):
 
 
 # -----------------------------------------------------------------------
-# Notice Reply AI — staged conversational workflow (Aug 2026 contract)
+# Notice Reply AI — v3 workflow (Aug 2026 vendor contract, base URL
+# host:5002 — a different port from the earlier v2 contract this
+# replaces).
 #
-# uploaded -> analysed -> (awaiting_inputs) -> drafted -> refined
+# uploaded -> ANALYSED_AWAITING_FACTS -> COLLECTING_FACTS -> DRAFTED
 #
-# Analysis always precedes drafting; the vendor (and, redundantly, this
-# app) refuses to draft before a successful analyze in the same
-# conversation. /notice/generate above is the legacy one-shot path and is
-# untouched by any of this.
+# analyze() never returns a draft. submissions() runs the facts/evidence
+# loop and auto-drafts once every allegation is answered (or on a "reply
+# as it is" trigger the vendor detects itself). draft() forces a draft
+# explicitly. refine() edits the current draft — v3 has no draft_id
+# concept, it acts on the session implicitly. There is no v3 /ask
+# endpoint; /notice/ask below is a compatibility shim for callers not yet
+# updated to call submissions/refine directly.
+# /notice/generate above is the legacy one-shot path — v3 repurposes it as
+# an explicit "reply as it is" shortcut, still analysing AND drafting in
+# one call — and is untouched by any of this.
 # -----------------------------------------------------------------------
 
 
@@ -672,7 +681,7 @@ async def list_notice_types(current_user: User = Depends(get_current_user)):
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Analyze Notice (Text)",
-    description="Stage 1 — analyse pasted/typed notice text into a summary and detected allegations.",
+    description="Analyse pasted/typed notice text into allegations + notice profile. Never returns a draft.",
 )
 async def analyze_notice(
     notice_text: str = Form(..., min_length=1, max_length=50000),
@@ -713,7 +722,7 @@ async def analyze_notice(
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Analyze Notice (File)",
-    description="Stage 1 — analyse an uploaded notice document (PDF/DOCX/TXT/scanned image PDF).",
+    description="Analyse an uploaded notice document into allegations + notice profile. Never returns a draft.",
 )
 async def analyze_notice_file(
     file: UploadFile = File(...),
@@ -755,11 +764,76 @@ async def analyze_notice_file(
 
 
 @router.post(
+    "/notice/submissions",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Submit Facts/Evidence For A Notice",
+    description=(
+        "Facts/evidence loop. Auto-drafts once every allegation is answered, or immediately "
+        'on a "reply as it is" style message.'
+    ),
+)
+async def submit_notice_facts(
+    request: NoticeSubmissionsRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.submit_notice_facts(
+            user_id=current_user.id,
+            conversation_id=request.conversation_id,
+            message=request.message,
+            ready_to_draft=request.ready_to_draft,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    except NoticeStageError as exc:
+        return JSONResponse(status_code=409, content=exc.detail)
+
+    return success_response(
+        data=result,
+        message="Submission recorded.",
+    )
+
+
+@router.post(
+    "/notice/submissions-file",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Submit Evidence Files For A Notice",
+    description="Multipart evidence upload — multiple files in one call.",
+)
+async def submit_notice_evidence_file(
+    files: list[UploadFile] = File(...),
+    conversation_id: int = Form(...),
+    note: str | None = Form(None),
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        result = await chat.submit_notice_evidence_file(
+            user_id=current_user.id,
+            conversation_id=conversation_id,
+            files=files,
+            note=note or "",
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    except NoticeStageError as exc:
+        return JSONResponse(status_code=409, content=exc.detail)
+
+    return success_response(
+        data=result,
+        message="Evidence submitted.",
+    )
+
+
+@router.post(
     "/notice/draft",
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Draft Notice Reply",
-    description="Stage 2 — draft the reply. `user_inputs` may be omitted entirely (draft now, from the notice alone).",
+    description="Force a draft explicitly, optionally with extra instructions or the DIN ground included.",
 )
 async def draft_notice(
     request: NoticeDraftRequest,
@@ -770,7 +844,9 @@ async def draft_notice(
         result = await chat.draft_notice(
             user_id=current_user.id,
             conversation_id=request.conversation_id,
-            user_inputs=request.user_inputs.dict(exclude_none=True) if request.user_inputs else None,
+            include_din_ground=request.include_din_ground,
+            extra_instruction=request.extra_instruction,
+            force=request.force,
         )
     except LookupError:
         raise HTTPException(status_code=404, detail="Conversation not found.")
@@ -788,7 +864,7 @@ async def draft_notice(
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
     summary="Refine Notice Reply",
-    description="Stage 3 — refine the current draft by free-text instruction. Repeatable; increments revision.",
+    description="Refine the current draft by free-text instruction. Repeatable.",
 )
 async def refine_notice(
     request: NoticeRefineRequest,
@@ -816,8 +892,11 @@ async def refine_notice(
     "/notice/ask",
     response_model=AIResponse,
     status_code=status.HTTP_200_OK,
-    summary="Ask About Notice",
-    description="Ask a question about the analysed notice without redrafting. Does not change stage.",
+    summary="Ask About Notice (compatibility shim)",
+    description=(
+        "COMPATIBILITY ONLY — v3 has no standalone ask endpoint. Dispatches to submissions "
+        "or refine depending on phase."
+    ),
 )
 async def ask_notice(
     request: NoticeAskRequest,

@@ -214,18 +214,18 @@ class ChatService:
         conversation: AIConversation,
     ) -> AIProviderSession:
         """
-        Notice Agent's own POST /api/v2/sessions (§0 of the Aug 2026 staged-
-        workflow contract) — previously undocumented for this vendor
-        service, so `get_or_create_provider_session` never called it and
-        Notice Reply always ran stateless (session_id/session_token both
-        omitted, "the service behaves exactly as it does today"). Kept as
-        its own method rather than folded into the generic helper above,
-        so the existing "main" session path is untouched.
+        Notice Agent v3: session_id is CLIENT-generated (the vendor's own
+        words: "You create it... Registration is optional (analyze adopts
+        an unseen id)"). There is no vendor session_token concept anymore
+        and no round trip is required to mint one — this method now only
+        finds-or-creates the LOCAL AIProviderSession row that carries our
+        own generated session_id string plus the notice conversation's
+        phase/allegations/evidence-matrix state.
 
-        `provider_metadata` on the returned row doubles as the local
-        record of the notice conversation's *stage* (uploaded -> analysed
-        -> drafted -> refined) plus the vendor's analysis_id/draft_id/
-        revision — see _notice_session_metadata / _save_notice_session_metadata.
+        `provider_session_token` is repurposed to hold the session_id we
+        hand the vendor on every call (kept as that column rather than
+        adding a new one, since it already means "the id this provider
+        needs to resume the conversation").
         """
 
         session = (
@@ -241,36 +241,17 @@ class ChatService:
         if session:
             return session
 
-        token = None
-        metadata: dict = {"stage": "uploaded"}
-
-        try:
-            response = await self.ai_service.notice_create_session(
-                {
-                    "metadata": {
-                        "conversation_id": conversation.id,
-                        "module": conversation.module,
-                        "tool": "notice",
-                    }
-                }
-            )
-            token = response.get("session_token")
-        except Exception:
-            # Same fallback philosophy as get_or_create_provider_session:
-            # don't block the conversation just because session
-            # provisioning failed — every staged call still works, just
-            # without vendor-side memory/state for this conversation.
-            logger.warning(
-                "Vendor session creation failed for notice conversation %s",
-                conversation.id,
-                exc_info=True,
-            )
+        # Our own conversation id, prefixed, is a perfectly good client
+        # session_id per the vendor's contract ("yours, string or
+        # number-as-string") — stable, unique, and traceable back to us in
+        # vendor-side logs if ever needed.
+        session_id = f"itl-notice-{conversation.id}"
 
         session = AIProviderSession(
             conversation_id=conversation.id,
             provider="notice",
-            provider_session_token=token,
-            provider_metadata=metadata,
+            provider_session_token=session_id,
+            provider_metadata={"phase": "uploaded"},
             status="active",
         )
 
@@ -291,8 +272,8 @@ class ChatService:
     ) -> None:
         """
         Merges `updates` into the notice session's stored metadata rather
-        than replacing it outright — e.g. saving a new `draft_id` must not
-        wipe out the already-stored `analysis_id`.
+        than replacing it outright — e.g. saving new evidence_matrix must
+        not wipe out the already-stored allegations.
         """
 
         meta = dict(provider_session.provider_metadata or {})
@@ -1325,67 +1306,129 @@ class ChatService:
             raise
 
     # ------------------------------------------------------------------
-    # Notice Reply AI — staged conversational workflow (Part B)
+    # Notice Reply AI — v3 workflow (Aug 2026 vendor contract, base URL
+    # host:5002). Flow: analyse (allegations only, NEVER a draft) ->
+    # submissions (facts/evidence loop, auto-drafts once every allegation
+    # is answered, or immediately on a "reply as it is" trigger phrase the
+    # vendor detects itself) -> draft (explicit/forced) -> refine (acts on
+    # the session's current draft implicitly — no draft_id concept in v3).
+    # There is no v3 /api/notice/ask; ask_notice() below is a compatibility
+    # shim for existing callers, not a real vendor endpoint.
     # ------------------------------------------------------------------
 
     @staticmethod
     def _render_notice_analysis_markdown(response: dict) -> str:
         """
-        The vendor deliberately returns no `generated_reply` at the
-        analysis stage (§B2 — "no legal opinion"). This renders the
-        structured notice_summary/allegations into a readable markdown
-        answer so the conversation transcript still shows something
-        meaningful for this turn; the frontend should prefer the
-        structured fields (notice_summary, allegations,
-        optional_inputs_prompt) returned alongside it for real rendering.
+        Renders the v3 analyse response (allegations + notice_profile, NO
+        draft — vendor's own rule: "analyze never returns a draft") into
+        readable markdown for the transcript. Prefers the vendor's own
+        `message` field (already formatted for a chat bubble per the
+        contract) and only builds a fallback from structured fields if
+        `message` is absent.
         """
+        message = response.get("message")
+        if message:
+            return message
 
-        summary = response.get("notice_summary") or {}
+        profile = response.get("notice_profile") or {}
         allegations = response.get("allegations") or []
 
         lines = ["**Notice Analysis**", ""]
-
         field_labels = [
             ("notice_type", "Notice type"),
-            ("form_number", "Form"),
-            ("issuing_authority", "Issuing authority"),
+            ("form", "Form"),
+            ("act", "Act"),
             ("tax_period", "Tax period"),
-            ("date_of_notice", "Date of notice"),
+            ("notice_date", "Notice date"),
+            ("hearing_date", "Hearing date"),
             ("reply_due_date", "Reply due"),
-            ("personal_hearing_date", "Personal hearing"),
         ]
         for key, label in field_labels:
-            value = summary.get(key)
+            value = profile.get(key)
             if value:
                 lines.append(f"- **{label}:** {value}")
 
-        amount = summary.get("amount_proposed") or {}
-        if amount:
-            currency = amount.get("currency", "INR")
+        amounts = profile.get("amounts") or {}
+        if any(amounts.get(k) for k in ("tax", "interest", "penalty")):
             lines.append(
-                f"- **Amount proposed:** Tax {currency} {amount.get('tax', 0):,} · "
-                f"Interest {currency} {amount.get('interest', 0):,} · "
-                f"Penalty {currency} {amount.get('penalty', 0):,}"
+                f"- **Amounts:** Tax {amounts.get('tax') or '-'} · "
+                f"Interest {amounts.get('interest') or '-'} · "
+                f"Penalty {amounts.get('penalty') or '-'}"
             )
 
         lines.append("")
         lines.append("**Allegations**")
         if allegations:
             for a in allegations:
-                ref = a.get("source_ref")
-                suffix = f" _({ref})_" if ref else ""
-                lines.append(f"{a.get('allegation_no', '?')}. {a.get('text', '')}{suffix}")
+                ref = a.get("section")
+                suffix = f" _(Section {ref})_" if ref else ""
+                lines.append(f"{a.get('id', '?')}. {a.get('allegation', '')}{suffix}")
         else:
             lines.append("No specific allegations were detected in this notice.")
 
         lines.append("")
         lines.append(
-            "_You can add optional context (facts, explanation, legal grounds, "
-            'supporting documents) or say "draft now" to generate the reply '
-            "straight away._"
+            '_Reply with the facts and evidence for each allegation, or say '
+            '"reply as it is" to draft the response from the notice alone._'
         )
 
         return "\n".join(lines)
+
+    def _notice_result_payload(
+        self,
+        *,
+        conversation: AIConversation,
+        user_message: AIMessage,
+        assistant_message: AIMessage,
+        response: dict,
+    ) -> dict:
+        """
+        Shared response envelope — analyse/submissions/draft/refine all
+        return this same shape, with fields simply absent when not
+        applicable to that call (e.g. evidence_matrix is null once
+        drafted). Mirrors the vendor's v3 field names directly rather than
+        translating them, to minimize drift between this contract and
+        what the vendor actually documents.
+        """
+        return {
+            "conversation": self._conversation_summary(conversation),
+            "user_message": {
+                "id": user_message.id,
+                "query": user_message.query,
+                "created_at": user_message.created_at,
+            },
+            "assistant_message": {
+                "id": assistant_message.id,
+                "answer": assistant_message.answer,
+                "created_at": assistant_message.created_at,
+            },
+            "phase": response.get("phase"),
+            "message": response.get("message"),
+            "allegations": response.get("allegations"),
+            "notice_profile": response.get("notice_profile"),
+            "review_notes": response.get("review_notes"),
+            "suggested_documents": response.get("suggested_documents"),
+            "evidence_matrix": response.get("evidence_matrix"),
+            "follow_up_questions": response.get("follow_up_questions"),
+            "unaddressed_allegations": response.get("unaddressed_allegations"),
+            "extracted_facts": response.get("extracted_facts"),
+            "ready_to_draft": response.get("ready_to_draft"),
+            "accepted_files": response.get("accepted_files"),
+            "rejected_files": response.get("rejected_files"),
+            "documents_on_record": response.get("documents_on_record"),
+            # Draft fields — present once phase == "DRAFTED".
+            "notice_type": response.get("notice_type"),
+            "reply_form": response.get("reply_form"),
+            "deadline": response.get("deadline"),
+            "fraud_track": response.get("fraud_track"),
+            "disclaimer": response.get("disclaimer"),
+            "escalation_warning": response.get("escalation_warning"),
+            "sources": response.get("sources"),
+            "verification": response.get("verification"),
+            "citation_audit": response.get("citation_audit"),
+            "pipeline": response.get("pipeline"),
+            "instruction_applied": response.get("instruction_applied"),
+        }
 
     async def analyze_notice(
         self,
@@ -1401,19 +1444,10 @@ class ChatService:
         address: str = "",
     ) -> dict:
         """
-        Stage 1 — POST /api/notice/analyze or /api/notice/analyze-file.
-        "Analysis always precedes drafting" (§B): this is the only entry
-        point that creates a notice conversation's session/stage state.
-
-        Falls back to the legacy one-shot /api/notice/process(-file) if the
-        vendor returns 404 for the staged endpoint — i.e. this vendor
-        deployment doesn't have the Aug 2026 staged workflow live yet. The
-        legacy path analyses AND drafts in one call, so a fallback
-        conversation starts at stage "drafted" rather than "analysed"; it's
-        flagged `legacy: True` in the session metadata so draft_notice/
-        refine_notice/ask_notice (which all depend on vendor-side
-        analysis_id/draft_id that only the staged endpoints mint) can fail
-        with a clear message instead of chasing another 404.
+        POST /api/notice/analyze(-file). Falls back to the legacy one-shot
+        /api/notice/process(-file) — which v3 repurposes as an explicit
+        "reply as it is" shortcut, still analysing AND drafting in one
+        call — if the staged endpoint 404s on this deployment.
         """
 
         if not (notice_text and notice_text.strip()) and file is None:
@@ -1432,6 +1466,7 @@ class ChatService:
             )
 
             provider_session = await self.get_or_create_notice_session(conversation)
+            session_id = provider_session.provider_session_token
 
             display_query = (notice_text or "").strip() or f"[Notice file: {getattr(file, 'filename', 'upload')}]"
 
@@ -1441,9 +1476,7 @@ class ChatService:
                 query=display_query,
             )
 
-            session_fields: dict = {"session_id": conversation.id}
-            if provider_session.provider_session_token:
-                session_fields["session_token"] = provider_session.provider_session_token
+            session_fields: dict = {"session_id": session_id, "conversation_id": conversation.id}
 
             file_bytes: Optional[bytes] = None
             if file is not None:
@@ -1482,11 +1515,9 @@ class ChatService:
             except AIResponseException as exc:
                 if exc.status_code != 404:
                     raise
-                # This vendor deployment doesn't have /api/notice/analyze(-file)
-                # yet — degrade to the legacy one-shot endpoint rather than
-                # surfacing a raw 404 to the user.
                 logger.warning(
-                    "Staged notice analyze 404'd for conversation %s — falling back to legacy /notice/process%s",
+                    "v3 notice analyze 404'd for conversation %s — falling back to legacy "
+                    "/notice/process%s (v3's own \"reply as it is\" one-shot path)",
                     conversation.id,
                     "-file" if file is not None else "",
                 )
@@ -1495,7 +1526,6 @@ class ChatService:
                     "user_name": user_name or "",
                     "business_name": business_name or "",
                     "gstin": gstin or "",
-                    "address": address or "",
                 }
                 try:
                     if file is not None:
@@ -1508,104 +1538,51 @@ class ChatService:
                             data={**legacy_data, "notice_text": notice_text},
                         )
                 except Exception as legacy_exc:
-                    # Both the staged AND the legacy endpoint failed — this
-                    # isn't "the staged workflow isn't deployed yet" anymore,
-                    # it's "the Notice AI service isn't reachable at all" at
-                    # whatever URL AI_NOTICE_URL currently points to. Fail
-                    # with one clear, diagnosable message instead of letting
-                    # the raw vendor error (which looks identical to a bug on
-                    # our end) reach the person.
                     logger.error(
-                        "Legacy notice fallback ALSO failed for conversation %s "
-                        "(staged endpoint 404'd, then legacy endpoint raised %r) — "
-                        "the Notice AI service looks unreachable at its configured URL.",
+                        "Legacy notice fallback ALSO failed for conversation %s: %r",
                         conversation.id,
                         legacy_exc,
                         exc_info=True,
                     )
                     raise NoticeUnavailableError(
                         "The Notice AI service is temporarily unavailable — neither the "
-                        "new nor the legacy endpoint could be reached. Please try again "
+                        "v3 nor the legacy endpoint could be reached. Please try again "
                         "shortly, or contact support if this persists."
                     ) from legacy_exc
 
             self._raise_if_pipeline_error(response)
-            self.save_provider_session_token(provider_session=provider_session, response=response)
 
             if legacy_fallback:
+                # Legacy /process(-file) IS v3's "reply as it is" — analyses
+                # and drafts in one call, so this goes straight to DRAFTED.
+                response.setdefault("phase", "DRAFTED")
                 normalized = self._normalize_provider_response("process", response)
+                answer = normalized.get("answer")
+                sources = normalized.get("sources")
+            else:
+                answer = self._render_notice_analysis_markdown(response)
+                sources = None
 
-                self._save_notice_session_metadata(
-                    provider_session,
-                    {"stage": "drafted", "legacy": True},
-                )
-
-                assistant_message = self.save_ai_message(
-                    conversation_id=conversation.id,
-                    provider="notice",
-                    response={
-                        "answer": normalized.get("answer"),
-                        "sources": normalized.get("sources"),
-                        "message_id": response.get("message_id"),
-                    },
-                    parent_message_id=user_message.id,
-                )
-                assistant_message.message_type = "notice_draft"
-                assistant_message.provider_metadata = {"stage": "drafted", "legacy": True}
-
-                self.update_conversation(conversation=conversation, provider="notice")
-                self.db.commit()
-
-                self.db.refresh(conversation)
-                self.db.refresh(user_message)
-                self.db.refresh(assistant_message)
-
-                return {
-                    "conversation": self._conversation_summary(conversation),
-                    "user_message": {
-                        "id": user_message.id,
-                        "query": user_message.query,
-                        "created_at": user_message.created_at,
-                    },
-                    "assistant_message": {
-                        "id": assistant_message.id,
-                        "answer": assistant_message.answer,
-                        "created_at": assistant_message.created_at,
-                    },
-                    # Reported as "drafted" (not "analysed") because the legacy
-                    # endpoint analyses AND drafts in a single call — there is
-                    # no separate analysis stage to stop at.
-                    "stage": "drafted",
-                    "legacy": True,
-                    "sources": normalized.get("sources"),
-                    "query_time_ms": response.get("query_time_ms"),
-                }
+            phase = response.get("phase") or ("DRAFTED" if legacy_fallback else "ANALYSED_AWAITING_FACTS")
 
             self._save_notice_session_metadata(
                 provider_session,
                 {
-                    "stage": response.get("stage", "analysed"),
-                    "analysis_id": response.get("analysis_id"),
-                    "notice_summary": response.get("notice_summary"),
+                    "phase": phase,
                     "allegations": response.get("allegations"),
+                    "notice_profile": response.get("notice_profile"),
+                    "legacy": legacy_fallback or None,
                 },
             )
 
             assistant_message = self.save_ai_message(
                 conversation_id=conversation.id,
                 provider="notice",
-                response={
-                    "answer": self._render_notice_analysis_markdown(response),
-                    "sources": None,
-                    "message_id": response.get("message_id"),
-                },
+                response={"answer": answer, "sources": sources, "message_id": response.get("message_id")},
                 parent_message_id=user_message.id,
             )
-            assistant_message.message_type = "notice_analysis"
-            assistant_message.provider_metadata = {
-                "stage": "analysed",
-                "analysis_id": response.get("analysis_id"),
-            }
+            assistant_message.message_type = "notice_draft" if legacy_fallback else "notice_analysis"
+            assistant_message.provider_metadata = {"phase": phase}
 
             self.update_conversation(conversation=conversation, provider="notice")
             self.db.commit()
@@ -1614,27 +1591,164 @@ class ChatService:
             self.db.refresh(user_message)
             self.db.refresh(assistant_message)
 
-            return {
-                "conversation": self._conversation_summary(conversation),
-                "user_message": {
-                    "id": user_message.id,
-                    "query": user_message.query,
-                    "created_at": user_message.created_at,
-                },
-                "assistant_message": {
-                    "id": assistant_message.id,
-                    "answer": assistant_message.answer,
-                    "created_at": assistant_message.created_at,
-                },
-                "stage": response.get("stage", "analysed"),
-                "analysis_id": response.get("analysis_id"),
-                "notice_summary": response.get("notice_summary"),
-                "allegations": response.get("allegations"),
-                "optional_inputs_prompt": response.get("optional_inputs_prompt"),
-                "extraction_quality": response.get("extraction_quality"),
-                "query_time_ms": response.get("query_time_ms"),
-            }
+            result = self._notice_result_payload(
+                conversation=conversation,
+                user_message=user_message,
+                assistant_message=assistant_message,
+                response=response,
+            )
+            result["phase"] = phase
+            return result
 
+        except Exception:
+            self.db.rollback()
+            raise
+
+    async def submit_notice_facts(
+        self,
+        *,
+        user_id: int,
+        conversation_id: int,
+        message: str,
+        ready_to_draft: bool = False,
+    ) -> dict:
+        """
+        POST /api/notice/submissions — the facts/evidence loop. The vendor
+        auto-drafts (phase "DRAFTED", generated_reply present) once every
+        allegation is answered, or immediately if `message` matches a
+        "reply as it is" trigger phrase (the vendor detects this itself —
+        we just pass the text through unmodified).
+        """
+        try:
+            conversation = self._get_owned_conversation(user_id, conversation_id)
+            provider_session = await self.get_or_create_notice_session(conversation)
+            meta = self._notice_session_metadata(provider_session)
+
+            if meta.get("phase", "uploaded") == "uploaded":
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "analysis_required",
+                    "detail": "The notice must be analysed before facts can be submitted.",
+                    "next_endpoint": "/api/notice/analyze",
+                    "phase": "uploaded",
+                })
+            if meta.get("legacy"):
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "legacy_mode",
+                    "detail": "This reply was generated by the legacy Notice AI and has no facts-collection step to continue.",
+                    "phase": meta.get("phase"),
+                })
+
+            user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=message)
+
+            payload = {
+                "session_id": provider_session.provider_session_token,
+                "message": message,
+                "ready_to_draft": ready_to_draft,
+            }
+            response = await self.ai_service.notice_submissions(payload)
+            self._raise_if_pipeline_error(response)
+
+            drafted = response.get("phase") == "DRAFTED" or bool(response.get("generated_reply"))
+            answer = response.get("generated_reply") if drafted else response.get("message")
+            sources = self._normalize_provider_response("process", response).get("sources") if drafted else None
+
+            self._save_notice_session_metadata(provider_session, {
+                "phase": response.get("phase") or ("DRAFTED" if drafted else "COLLECTING_FACTS"),
+                "evidence_matrix": response.get("evidence_matrix"),
+                "unaddressed_allegations": response.get("unaddressed_allegations"),
+            })
+
+            assistant_message = self.save_ai_message(
+                conversation_id=conversation.id, provider="notice",
+                response={"answer": answer, "sources": sources, "message_id": response.get("message_id")},
+                parent_message_id=user_message.id,
+            )
+            assistant_message.message_type = "notice_draft" if drafted else "notice_submission"
+            assistant_message.provider_metadata = {"phase": response.get("phase")}
+
+            self.update_conversation(conversation=conversation, provider="notice")
+            self.db.commit()
+            self.db.refresh(conversation)
+            self.db.refresh(user_message)
+            self.db.refresh(assistant_message)
+
+            return self._notice_result_payload(
+                conversation=conversation, user_message=user_message,
+                assistant_message=assistant_message, response=response,
+            )
+        except Exception:
+            self.db.rollback()
+            raise
+
+    async def submit_notice_evidence_file(
+        self,
+        *,
+        user_id: int,
+        conversation_id: int,
+        files: list,
+        note: str = "",
+    ) -> dict:
+        """POST /api/notice/submissions-file — multipart evidence upload, repeatable `files` field."""
+        try:
+            conversation = self._get_owned_conversation(user_id, conversation_id)
+            provider_session = await self.get_or_create_notice_session(conversation)
+            meta = self._notice_session_metadata(provider_session)
+
+            if meta.get("phase", "uploaded") == "uploaded":
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "analysis_required",
+                    "detail": "The notice must be analysed before evidence can be submitted.",
+                    "next_endpoint": "/api/notice/analyze",
+                    "phase": "uploaded",
+                })
+
+            filenames = ", ".join(f.filename for f in files if getattr(f, "filename", None))
+            display_query = note.strip() if note and note.strip() else f"[Evidence uploaded: {filenames}]"
+            user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=display_query)
+
+            multipart_files = []
+            for f in files:
+                content = await f.read()
+                multipart_files.append(("files", (f.filename, content, f.content_type)))
+
+            data = {"session_id": provider_session.provider_session_token, "note": note or ""}
+            response = await self.ai_service.notice_submissions_file(data=data, files=multipart_files)
+            self._raise_if_pipeline_error(response)
+
+            drafted = response.get("phase") == "DRAFTED" or bool(response.get("generated_reply"))
+            answer = response.get("generated_reply") if drafted else response.get("message")
+
+            self._save_notice_session_metadata(provider_session, {
+                "phase": response.get("phase") or ("DRAFTED" if drafted else "COLLECTING_FACTS"),
+                "evidence_matrix": response.get("evidence_matrix"),
+                "unaddressed_allegations": response.get("unaddressed_allegations"),
+            })
+
+            assistant_message = self.save_ai_message(
+                conversation_id=conversation.id, provider="notice",
+                response={"answer": answer, "sources": None, "message_id": response.get("message_id")},
+                parent_message_id=user_message.id,
+            )
+            assistant_message.message_type = "notice_draft" if drafted else "notice_submission"
+            assistant_message.provider_metadata = {"phase": response.get("phase")}
+
+            self.update_conversation(conversation=conversation, provider="notice")
+            self.db.commit()
+            self.db.refresh(conversation)
+            self.db.refresh(user_message)
+            self.db.refresh(assistant_message)
+
+            result = self._notice_result_payload(
+                conversation=conversation, user_message=user_message,
+                assistant_message=assistant_message, response=response,
+            )
+            result["accepted_files"] = response.get("accepted_files")
+            result["rejected_files"] = response.get("rejected_files")
+            result["documents_on_record"] = response.get("documents_on_record")
+            return result
         except Exception:
             self.db.rollback()
             raise
@@ -1644,139 +1758,75 @@ class ChatService:
         *,
         user_id: int,
         conversation_id: int,
-        user_inputs: Optional[dict] = None,
+        include_din_ground: bool = False,
+        extra_instruction: str = "",
+        force: bool = False,
     ) -> dict:
         """
-        Stage 2 — POST /api/notice/draft. `user_inputs` may be {} or
-        omitted entirely (the "draft now" path, §B3) — never required.
+        POST /api/notice/draft — explicit trigger. Normally the vendor
+        auto-drafts from submissions() once every allegation is answered;
+        this is for forcing a draft despite open follow-ups (`force=true`)
+        or drafting with extra instructions / the DIN ground included.
         """
-
         try:
             conversation = self._get_owned_conversation(user_id, conversation_id)
             provider_session = await self.get_or_create_notice_session(conversation)
             meta = self._notice_session_metadata(provider_session)
 
-            analysis_id = meta.get("analysis_id")
-            if not analysis_id:
-                # Local fast-fail mirroring the vendor's own 409 shape
-                # (§B3) — no need for a round trip to learn what our own
-                # stored stage already tells us. A conversation started via
-                # the legacy fallback (see analyze_notice) never has an
-                # analysis_id — it went straight to a drafted reply — so
-                # give that its own explanation rather than "must be
-                # analysed", which would be misleading here.
-                if meta.get("legacy"):
-                    raise NoticeStageError(
-                        {
-                            "success": False,
-                            "error": "legacy_mode",
-                            "detail": (
-                                "This conversation's reply was generated by the legacy "
-                                "Notice AI (the staged analyse/draft endpoints aren't "
-                                "available on this deployment yet), so there's no "
-                                "separate analysis step to draft from."
-                            ),
-                            "stage": "drafted",
-                        }
-                    )
-                raise NoticeStageError(
-                    {
-                        "success": False,
-                        "error": "analysis_required",
-                        "detail": "The notice must be analysed before a reply can be drafted.",
-                        "next_endpoint": "/api/notice/analyze",
-                        "stage": meta.get("stage", "uploaded"),
-                    }
-                )
+            if meta.get("phase", "uploaded") == "uploaded":
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "analysis_required",
+                    "detail": "The notice must be analysed before a reply can be drafted.",
+                    "next_endpoint": "/api/notice/analyze",
+                    "phase": "uploaded",
+                })
+            if meta.get("legacy"):
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "legacy_mode",
+                    "detail": "This reply was already drafted by the legacy Notice AI.",
+                    "phase": meta.get("phase"),
+                })
 
-            has_inputs = bool(user_inputs)
-            display_query = (
-                "Draft the reply (with additional context provided)"
-                if has_inputs
-                else "Draft the reply based only on the uploaded notice"
-            )
+            display_query = "Draft the reply" + (" (forced despite open questions)" if force else "")
+            user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=display_query)
 
-            user_message = self.save_user_message(
-                conversation_id=conversation.id,
-                provider="notice",
-                query=display_query,
-            )
-
-            payload: dict = {
-                "session_id": conversation.id,
-                "analysis_id": analysis_id,
-                "user_inputs": user_inputs or {},
+            payload = {
+                "session_id": provider_session.provider_session_token,
+                "include_din_ground": include_din_ground,
+                "extra_instruction": extra_instruction or "",
+                "force": force,
             }
-            if provider_session.provider_session_token:
-                payload["session_token"] = provider_session.provider_session_token
-
             response = await self.ai_service.notice_draft(payload)
             self._raise_if_pipeline_error(response)
-            self.save_provider_session_token(provider_session=provider_session, response=response)
 
-            draft_id = response.get("draft_id")
-            self._save_notice_session_metadata(
-                provider_session,
-                {
-                    "stage": response.get("stage", "drafted"),
-                    "draft_id": draft_id,
-                    "revision": 1,
-                },
-            )
+            normalized = self._normalize_provider_response("process", response)
+
+            self._save_notice_session_metadata(provider_session, {"phase": response.get("phase") or "DRAFTED"})
 
             assistant_message = self.save_ai_message(
-                conversation_id=conversation.id,
-                provider="notice",
+                conversation_id=conversation.id, provider="notice",
                 response={
-                    "answer": response.get("generated_reply"),
-                    "sources": response.get("sources"),
-                    "verification": response.get("verification"),
+                    "answer": normalized.get("answer") or response.get("generated_reply"),
+                    "sources": normalized.get("sources"),
                     "message_id": response.get("message_id"),
                 },
                 parent_message_id=user_message.id,
             )
             assistant_message.message_type = "notice_draft"
-            assistant_message.provider_metadata = {
-                "stage": "drafted",
-                "analysis_id": analysis_id,
-                "draft_id": draft_id,
-                "revision": 1,
-            }
+            assistant_message.provider_metadata = {"phase": response.get("phase") or "DRAFTED"}
 
             self.update_conversation(conversation=conversation, provider="notice")
             self.db.commit()
-
             self.db.refresh(conversation)
             self.db.refresh(user_message)
             self.db.refresh(assistant_message)
 
-            return {
-                "conversation": self._conversation_summary(conversation),
-                "user_message": {
-                    "id": user_message.id,
-                    "query": user_message.query,
-                    "created_at": user_message.created_at,
-                },
-                "assistant_message": {
-                    "id": assistant_message.id,
-                    "answer": assistant_message.answer,
-                    "created_at": assistant_message.created_at,
-                },
-                "stage": response.get("stage", "drafted"),
-                "draft_id": draft_id,
-                "reply_form": response.get("reply_form"),
-                "deadline": response.get("deadline"),
-                "fraud_track": response.get("fraud_track"),
-                "allegation_coverage": response.get("allegation_coverage"),
-                "sources": response.get("sources"),
-                "verification": response.get("verification"),
-                "citation_audit": response.get("citation_audit"),
-                "advisory_notes": response.get("advisory_notes"),
-                "escalation_warning": response.get("escalation_warning"),
-                "disclaimer": response.get("disclaimer"),
-                "query_time_ms": response.get("query_time_ms"),
-            }
-
+            return self._notice_result_payload(
+                conversation=conversation, user_message=user_message,
+                assistant_message=assistant_message, response=response,
+            )
         except Exception:
             self.db.rollback()
             raise
@@ -1789,122 +1839,60 @@ class ChatService:
         instruction: str,
     ) -> dict:
         """
-        Stage 3 — POST /api/notice/refine. Repeatable: each call
-        increments `revision` and returns a new draft_id (§B4), so the
-        transcript can offer "undo to an earlier revision".
+        POST /api/notice/refine — v3 has no draft_id concept; refine acts
+        on the session's current draft implicitly via session_id alone.
         """
-
         try:
             conversation = self._get_owned_conversation(user_id, conversation_id)
             provider_session = await self.get_or_create_notice_session(conversation)
             meta = self._notice_session_metadata(provider_session)
 
-            draft_id = meta.get("draft_id")
-            if not draft_id:
-                if meta.get("legacy"):
-                    raise NoticeStageError(
-                        {
-                            "success": False,
-                            "error": "legacy_mode",
-                            "detail": (
-                                "This reply was generated by the legacy Notice AI, which "
-                                "has no staged draft to refine. Ask a follow-up question "
-                                "instead, or start a new notice once the staged endpoints "
-                                "are available on this deployment."
-                            ),
-                            "stage": "drafted",
-                        }
-                    )
-                raise NoticeStageError(
-                    {
-                        "success": False,
-                        "error": "draft_required",
-                        "detail": "A reply must be drafted before it can be refined.",
-                        "next_endpoint": "/api/notice/draft",
-                        "stage": meta.get("stage", "uploaded"),
-                    }
-                )
+            if meta.get("phase") != "DRAFTED" and not meta.get("legacy"):
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "draft_required",
+                    "detail": "A reply must be drafted before it can be refined.",
+                    "next_endpoint": "/api/notice/draft",
+                    "phase": meta.get("phase", "uploaded"),
+                })
+            if meta.get("legacy"):
+                raise NoticeStageError({
+                    "success": False,
+                    "error": "legacy_mode",
+                    "detail": "This reply was generated by the legacy Notice AI and has no live session to refine.",
+                    "phase": meta.get("phase"),
+                })
 
-            user_message = self.save_user_message(
-                conversation_id=conversation.id,
-                provider="notice",
-                query=instruction,
-            )
+            user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=instruction)
 
-            payload: dict = {
-                "session_id": conversation.id,
-                "draft_id": draft_id,
-                "instruction": instruction,
-            }
-            if provider_session.provider_session_token:
-                payload["session_token"] = provider_session.provider_session_token
-
+            payload = {"session_id": provider_session.provider_session_token, "instruction": instruction}
             response = await self.ai_service.notice_refine(payload)
             self._raise_if_pipeline_error(response)
-            self.save_provider_session_token(provider_session=provider_session, response=response)
 
-            new_draft_id = response.get("draft_id", draft_id)
-            new_revision = response.get("revision") or (int(meta.get("revision") or 1) + 1)
-
-            self._save_notice_session_metadata(
-                provider_session,
-                {
-                    "stage": response.get("stage", "refined"),
-                    "draft_id": new_draft_id,
-                    "revision": new_revision,
-                },
-            )
+            new_revision = int(meta.get("revision") or 1) + 1
+            self._save_notice_session_metadata(provider_session, {"phase": "DRAFTED", "revision": new_revision})
 
             assistant_message = self.save_ai_message(
-                conversation_id=conversation.id,
-                provider="notice",
-                response={
-                    "answer": response.get("generated_reply"),
-                    "sources": response.get("sources"),
-                    "verification": response.get("verification"),
-                    "message_id": response.get("message_id"),
-                },
+                conversation_id=conversation.id, provider="notice",
+                response={"answer": response.get("generated_reply"), "sources": None, "message_id": response.get("message_id")},
                 parent_message_id=user_message.id,
             )
             assistant_message.message_type = "notice_refine"
-            assistant_message.provider_metadata = {
-                "stage": "refined",
-                "draft_id": new_draft_id,
-                "previous_draft_id": response.get("previous_draft_id", draft_id),
-                "revision": new_revision,
-            }
+            assistant_message.provider_metadata = {"phase": "DRAFTED", "revision": new_revision}
 
             self.update_conversation(conversation=conversation, provider="notice")
             self.db.commit()
-
             self.db.refresh(conversation)
             self.db.refresh(user_message)
             self.db.refresh(assistant_message)
 
-            return {
-                "conversation": self._conversation_summary(conversation),
-                "user_message": {
-                    "id": user_message.id,
-                    "query": user_message.query,
-                    "created_at": user_message.created_at,
-                },
-                "assistant_message": {
-                    "id": assistant_message.id,
-                    "answer": assistant_message.answer,
-                    "created_at": assistant_message.created_at,
-                },
-                "stage": response.get("stage", "refined"),
-                "draft_id": new_draft_id,
-                "previous_draft_id": response.get("previous_draft_id", draft_id),
-                "revision": new_revision,
-                "changes_summary": response.get("changes_summary"),
-                "allegation_coverage": response.get("allegation_coverage"),
-                "verification": response.get("verification"),
-                "citation_audit": response.get("citation_audit"),
-                "disclaimer": response.get("disclaimer"),
-                "query_time_ms": response.get("query_time_ms"),
-            }
-
+            result = self._notice_result_payload(
+                conversation=conversation, user_message=user_message,
+                assistant_message=assistant_message, response=response,
+            )
+            result["revision"] = new_revision
+            result["instruction_applied"] = response.get("instruction_applied")
+            return result
         except Exception:
             self.db.rollback()
             raise
@@ -1917,100 +1905,35 @@ class ChatService:
         question: str,
     ) -> dict:
         """
-        §B5 — POST /api/notice/ask. Grounded in the analysed notice; does
-        NOT change stage and does NOT touch the current draft, so this
-        never advances/overwrites analysis_id, draft_id, or revision.
+        COMPATIBILITY SHIM ONLY — v3 has no standalone /api/notice/ask
+        endpoint anymore. Kept so existing callers (e.g. a not-yet-updated
+        frontend) keep working: dispatches to submit_notice_facts() while
+        still collecting facts, or refine_notice() once drafted — the
+        closest v3-native equivalent to "the user typed a follow-up".
         """
+        conversation = self._get_owned_conversation(user_id, conversation_id)
+        provider_session = await self.get_or_create_notice_session(conversation)
+        meta = self._notice_session_metadata(provider_session)
+        phase = meta.get("phase", "uploaded")
 
-        try:
-            conversation = self._get_owned_conversation(user_id, conversation_id)
-            provider_session = await self.get_or_create_notice_session(conversation)
-            meta = self._notice_session_metadata(provider_session)
-
-            if meta.get("stage", "uploaded") == "uploaded":
-                raise NoticeStageError(
-                    {
-                        "success": False,
-                        "error": "analysis_required",
-                        "detail": "The notice must be analysed before it can be asked about.",
-                        "next_endpoint": "/api/notice/analyze",
-                        "stage": "uploaded",
-                    }
-                )
-
-            if meta.get("legacy"):
-                # /notice/ask is part of the same staged release as
-                # /notice/analyze — if that 404'd for this conversation,
-                # /notice/ask will too. Fail fast with a clear explanation
-                # rather than a second confusing 404 round trip.
-                raise NoticeStageError(
-                    {
-                        "success": False,
-                        "error": "legacy_mode",
-                        "detail": (
-                            "This conversation is running on the legacy Notice AI, which "
-                            "doesn't support grounded follow-up questions. Start a new "
-                            "notice once the staged endpoints are available on this "
-                            "deployment, or ask this in a fresh Ask Bot conversation."
-                        ),
-                        "stage": meta.get("stage"),
-                    }
-                )
-
-            user_message = self.save_user_message(
-                conversation_id=conversation.id,
-                provider="notice",
-                query=question,
-            )
-
-            payload: dict = {"session_id": conversation.id, "question": question}
-            if provider_session.provider_session_token:
-                payload["session_token"] = provider_session.provider_session_token
-
-            response = await self.ai_service.notice_ask(payload)
-            self._raise_if_pipeline_error(response)
-            self.save_provider_session_token(provider_session=provider_session, response=response)
-
-            assistant_message = self.save_ai_message(
-                conversation_id=conversation.id,
-                provider="notice",
-                response={
-                    "answer": response.get("answer"),
-                    "sources": response.get("sources"),
-                    "message_id": response.get("message_id"),
-                },
-                parent_message_id=user_message.id,
-            )
-            assistant_message.message_type = "notice_ask"
-            assistant_message.provider_metadata = {"stage": meta.get("stage")}
-
-            self.update_conversation(conversation=conversation, provider="notice")
-            self.db.commit()
-
-            self.db.refresh(conversation)
-            self.db.refresh(user_message)
-            self.db.refresh(assistant_message)
-
-            return {
-                "conversation": self._conversation_summary(conversation),
-                "user_message": {
-                    "id": user_message.id,
-                    "query": user_message.query,
-                    "created_at": user_message.created_at,
-                },
-                "assistant_message": {
-                    "id": assistant_message.id,
-                    "answer": assistant_message.answer,
-                    "created_at": assistant_message.created_at,
-                },
-                "stage": meta.get("stage"),
-                "citation_audit": response.get("citation_audit"),
-                "query_time_ms": response.get("query_time_ms"),
-            }
-
-        except Exception:
-            self.db.rollback()
-            raise
+        if phase == "uploaded":
+            raise NoticeStageError({
+                "success": False,
+                "error": "analysis_required",
+                "detail": "The notice must be analysed before it can be asked about.",
+                "next_endpoint": "/api/notice/analyze",
+                "phase": "uploaded",
+            })
+        if meta.get("legacy"):
+            raise NoticeStageError({
+                "success": False,
+                "error": "legacy_mode",
+                "detail": "This reply was generated by the legacy Notice AI, which doesn't support follow-up questions.",
+                "phase": phase,
+            })
+        if phase == "DRAFTED":
+            return await self.refine_notice(user_id=user_id, conversation_id=conversation_id, instruction=question)
+        return await self.submit_notice_facts(user_id=user_id, conversation_id=conversation_id, message=question)
 
     # ------------------------------------------------------------------
     # Async job polling (Summarizer large-document flow)

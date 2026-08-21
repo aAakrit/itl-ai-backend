@@ -52,13 +52,16 @@ class NoticeEndpoints:
     PROCESS_FILE = "/api/notice/process-file"
     TYPES = "/api/notice/types"
     HEALTH = "/api/health"
-
+    
     SESSIONS = "/api/v2/sessions"
     ANALYZE_TEXT = "/api/notice/analyze"
     ANALYZE_FILE = "/api/notice/analyze-file"
+    SUBMISSIONS = "/api/notice/submissions"
+    SUBMISSIONS_FILE = "/api/notice/submissions-file"
     DRAFT = "/api/notice/draft"
     REFINE = "/api/notice/refine"
-    ASK = "/api/notice/ask"
+    SESSION_STATUS = "/api/notice/session/{session_id}"
+    SUPPORTED_FORMATS = "/api/notice/supported-formats"
 
 
 class SummarizerEndpoints:
