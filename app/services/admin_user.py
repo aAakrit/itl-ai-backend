@@ -12,6 +12,7 @@ from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.admin_user import UserUpdate
 from app.services.audit_service import log_action
+from app.services.auth_utils import hash_password
 
 
 SUBSCRIPTION_STATUSES = {"pending", "active", "suspended", "cancelled", "expired"}
@@ -374,6 +375,10 @@ def get_users(
                 "email": user.email,
                 "mobile": user.mobile,
                 "firm": user.firm,
+                "address": user.address,
+                "city": user.city,
+                "state": user.state,
+                "pin_code": user.pin_code,
                 "plan": subscription.plan_name if subscription else getattr(user, "plan", None),
                 "role": _role_name(user),
                 "status": user.status,
@@ -455,6 +460,13 @@ def update_user(db: Session, user_id: int, payload: UserUpdate, admin_id: int):
     # so pricing snapshots, dates and audit records remain consistent.
     data.pop("plan", None)
 
+    # Password is handled separately: it's hashed before storage and is
+    # deliberately excluded from the audit log's previous/new value dump
+    # below so a plaintext password never ends up in the audit trail.
+    new_password = data.pop("password", None)
+    if new_password is not None and not new_password.strip():
+        new_password = None
+
     editable_fields = {
         "name",
         "firm",
@@ -479,19 +491,31 @@ def update_user(db: Session, user_id: int, payload: UserUpdate, admin_id: int):
     for field, value in data.items():
         setattr(user, field, value)
 
+    if new_password is not None:
+        user.password = hash_password(new_password)
+
     user.updated_at = datetime.utcnow()
     db.flush()
 
-    new_values = {field: getattr(user, field) for field in data}
-    log_action(
-        db,
-        actor_id=admin_id,
-        action="user.updated",
-        target_type="user",
-        target_id=user.id,
-        previous_value=previous,
-        new_value=new_values,
-    )
+    if data:
+        new_values = {field: getattr(user, field) for field in data}
+        log_action(
+            db,
+            actor_id=admin_id,
+            action="user.updated",
+            target_type="user",
+            target_id=user.id,
+            previous_value=previous,
+            new_value=new_values,
+        )
+    if new_password is not None:
+        log_action(
+            db,
+            actor_id=admin_id,
+            action="user.password_reset",
+            target_type="user",
+            target_id=user.id,
+        )
 
     db.commit()
     db.refresh(user)

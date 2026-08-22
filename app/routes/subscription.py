@@ -29,6 +29,15 @@ def get_db():
         db.close()
 
 
+def _enrich(sub):
+    """Attaches the owning user's name/email as transient attributes so
+    SubscriptionResponse.model_validate can pick them up — see the
+    user_name/user_email fields on that schema."""
+    sub.user_name = sub.user.name if sub.user else None
+    sub.user_email = sub.user.email if sub.user else None
+    return sub
+
+
 @router.get("")
 def list_subscriptions(
     page: int = Query(1, ge=1),
@@ -57,7 +66,7 @@ def list_subscriptions(
     )
     return {
         **result,
-        "items": [SubscriptionResponse.model_validate(s) for s in result["items"]],
+        "items": [SubscriptionResponse.model_validate(_enrich(s)) for s in result["items"]],
     }
 
 
@@ -67,7 +76,7 @@ def get_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.get(db, subscription_id)
+    return _enrich(service.get(db, subscription_id))
 
 
 @router.post("/manual", response_model=SubscriptionResponse)
@@ -76,7 +85,7 @@ def create_manual_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.create_manual(db, admin.id, payload)
+    return _enrich(service.create_manual(db, admin.id, payload))
 
 
 @router.put("/{subscription_id}", response_model=SubscriptionResponse)
@@ -86,7 +95,7 @@ def update_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.update(db, admin.id, subscription_id, payload)
+    return _enrich(service.update(db, admin.id, subscription_id, payload))
 
 
 @router.post("/{subscription_id}/extend", response_model=SubscriptionResponse)
@@ -96,7 +105,7 @@ def extend_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.extend(db, admin.id, subscription_id, payload.days, payload.reason)
+    return _enrich(service.extend(db, admin.id, subscription_id, payload.days, payload.reason))
 
 
 @router.post("/{subscription_id}/suspend", response_model=SubscriptionResponse)
@@ -106,7 +115,7 @@ def suspend_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.set_status(db, admin.id, subscription_id, "suspended", reason)
+    return _enrich(service.set_status(db, admin.id, subscription_id, "suspended", reason))
 
 
 @router.post("/{subscription_id}/cancel", response_model=SubscriptionResponse)
@@ -116,7 +125,7 @@ def cancel_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.set_status(db, admin.id, subscription_id, "cancelled", reason)
+    return _enrich(service.set_status(db, admin.id, subscription_id, "cancelled", reason))
 
 
 @router.post("/{subscription_id}/activate", response_model=SubscriptionResponse)
@@ -126,4 +135,4 @@ def activate_subscription(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    return service.set_status(db, admin.id, subscription_id, "active", reason)
+    return _enrich(service.set_status(db, admin.id, subscription_id, "active", reason))

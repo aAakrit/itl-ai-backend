@@ -23,6 +23,11 @@ class UserUpdate(BaseModel):
     is_admin: Optional[bool] = None
     is_staff: Optional[bool] = None
 
+    # Admin-triggered password reset. Never returned by any endpoint —
+    # write-only. Hashed before storage; excluded from the audit log's
+    # before/after value dump (see admin_user.update_user).
+    password: Optional[str] = None
+
 class UserListItem(BaseModel):
     id: int
 

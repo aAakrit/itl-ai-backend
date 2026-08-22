@@ -300,6 +300,114 @@ class ChatService:
             "last_message_at": conversation.last_message_at,
         }
 
+    async def _recover_notice_session(
+        self,
+        conversation: AIConversation,
+        provider_session: AIProviderSession,
+    ) -> bool:
+        """
+        Handles the vendor's documented 409 "session unknown" case: the
+        Notice Agent v3 service keeps session state in memory only ("this
+        service writes nothing to the database"), so any restart/redeploy
+        loses every in-flight conversation. The vendor's own recovery
+        instruction is to silently re-POST /analyze with the SAME
+        session_id (+ the original notice_text/file) — "Phase 1 re-runs
+        silently and the user continues" — then retry whatever call
+        actually 409'd. This does that re-warming step only; the caller
+        retries its own request afterward. Returns False (recovery not
+        possible) for a legacy-fallback session, since those never had a
+        live v3 session to re-warm in the first place.
+        """
+        meta = self._notice_session_metadata(provider_session)
+        if meta.get("legacy"):
+            return False
+
+        session_id = provider_session.provider_session_token
+        common = {
+            "session_id": session_id,
+            "conversation_id": conversation.id,
+            "user_name": meta.get("original_user_name") or "",
+            "business_name": meta.get("original_business_name") or "",
+            "gstin": meta.get("original_gstin") or "",
+            "address": meta.get("original_address") or "",
+        }
+
+        original_text = meta.get("original_notice_text")
+        if original_text:
+            try:
+                await self.ai_service.notice_analyze({**common, "notice_text": original_text})
+                return True
+            except Exception:
+                logger.warning(
+                    "Notice session recovery (text) failed for conversation %s",
+                    conversation.id,
+                    exc_info=True,
+                )
+                return False
+
+        # File-based analyze: re-read the originally uploaded document from
+        # our own storage and resend it under the same session_id.
+        first_message = (
+            self.db.query(AIMessage)
+            .filter(
+                AIMessage.conversation_id == conversation.id,
+                AIMessage.provider == "notice",
+                AIMessage.attachment_path.isnot(None),
+            )
+            .order_by(AIMessage.id.asc())
+            .first()
+        )
+        if not first_message or not first_message.attachment_path:
+            return False
+
+        try:
+            file_bytes = storage.read_file(first_message.attachment_path)
+            await self.ai_service.notice_analyze_file(
+                data=common,
+                files={
+                    "file": (
+                        first_message.attachment_filename or "notice-upload",
+                        file_bytes,
+                        first_message.attachment_content_type or "application/octet-stream",
+                    )
+                },
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Notice session recovery (file) failed for conversation %s",
+                conversation.id,
+                exc_info=True,
+            )
+            return False
+
+    async def _call_notice_vendor_with_recovery(
+        self,
+        conversation: AIConversation,
+        provider_session: AIProviderSession,
+        call,
+    ):
+        """
+        Wraps a single vendor call (submissions/submissions-file/draft/
+        refine) with one retry after silently re-warming the session on a
+        409. `call` is a zero-arg async callable so it can be retried
+        as-is — file uploads are read into memory before this is invoked
+        so a retry doesn't need to re-read an already-consumed stream.
+        """
+        try:
+            return await call()
+        except AIResponseException as exc:
+            if exc.status_code != 409:
+                raise
+            recovered = await self._recover_notice_session(conversation, provider_session)
+            if not recovered:
+                raise
+            logger.info(
+                "Notice session recovered for conversation %s after vendor 409 — retrying original call",
+                conversation.id,
+            )
+            return await call()
+
     # ------------------------------------------------------------------
     # User Message
     # ------------------------------------------------------------------
@@ -1572,6 +1680,18 @@ class ChatService:
                     "allegations": response.get("allegations"),
                     "notice_profile": response.get("notice_profile"),
                     "legacy": legacy_fallback or None,
+                    # Recovery info for the vendor's documented 409 "session
+                    # unknown" case (service restarted — it keeps NOTHING
+                    # in its own DB, per the contract's own persistence
+                    # note). On that 409 we silently re-POST /analyze with
+                    # this same notice_text/file to re-warm the session,
+                    # then retry the call that actually failed — see
+                    # _recover_notice_session below.
+                    "original_notice_text": notice_text if not legacy_fallback else None,
+                    "original_user_name": user_name or None,
+                    "original_business_name": business_name or None,
+                    "original_gstin": gstin or None,
+                    "original_address": address or None,
                 },
             )
 
@@ -1644,10 +1764,13 @@ class ChatService:
 
             payload = {
                 "session_id": provider_session.provider_session_token,
+                "conversation_id": conversation.id,
                 "message": message,
                 "ready_to_draft": ready_to_draft,
             }
-            response = await self.ai_service.notice_submissions(payload)
+            response = await self._call_notice_vendor_with_recovery(
+                conversation, provider_session, lambda: self.ai_service.notice_submissions(payload)
+            )
             self._raise_if_pipeline_error(response)
 
             drafted = response.get("phase") == "DRAFTED" or bool(response.get("generated_reply"))
@@ -1735,8 +1858,16 @@ class ChatService:
                 content = await f.read()
                 multipart_files.append(("files", (f.filename, content, f.content_type)))
 
-            data = {"session_id": provider_session.provider_session_token, "note": note or ""}
-            response = await self.ai_service.notice_submissions_file(data=data, files=multipart_files)
+            data = {
+                "session_id": provider_session.provider_session_token,
+                "conversation_id": conversation.id,
+                "note": note or "",
+            }
+            response = await self._call_notice_vendor_with_recovery(
+                conversation,
+                provider_session,
+                lambda: self.ai_service.notice_submissions_file(data=data, files=multipart_files),
+            )
             self._raise_if_pipeline_error(response)
 
             drafted = response.get("phase") == "DRAFTED" or bool(response.get("generated_reply"))
@@ -1750,11 +1881,14 @@ class ChatService:
                 # the person stuck with uploaded documents and no reply.
                 draft_payload = {
                     "session_id": provider_session.provider_session_token,
+                    "conversation_id": conversation.id,
                     "include_din_ground": False,
                     "extra_instruction": "",
                     "force": True,
                 }
-                response = await self.ai_service.notice_draft(draft_payload)
+                response = await self._call_notice_vendor_with_recovery(
+                    conversation, provider_session, lambda: self.ai_service.notice_draft(draft_payload)
+                )
                 self._raise_if_pipeline_error(response)
                 drafted = True
 
@@ -1833,11 +1967,14 @@ class ChatService:
 
             payload = {
                 "session_id": provider_session.provider_session_token,
+                "conversation_id": conversation.id,
                 "include_din_ground": include_din_ground,
                 "extra_instruction": extra_instruction or "",
                 "force": force,
             }
-            response = await self.ai_service.notice_draft(payload)
+            response = await self._call_notice_vendor_with_recovery(
+                conversation, provider_session, lambda: self.ai_service.notice_draft(payload)
+            )
             self._raise_if_pipeline_error(response)
 
             normalized = self._normalize_provider_response("process", response)
@@ -1904,8 +2041,32 @@ class ChatService:
 
             user_message = self.save_user_message(conversation_id=conversation.id, provider="notice", query=instruction)
 
-            payload = {"session_id": provider_session.provider_session_token, "instruction": instruction}
-            response = await self.ai_service.notice_refine(payload)
+            # current_draft is only optional "if session_id is live" per
+            # the vendor's own spec — always send it (our own last-known
+            # draft text) rather than relying on that assumption. This
+            # also means refine still works correctly even after a vendor
+            # restart, since re-warming the session via /analyze only
+            # restores allegations, not the specific draft being edited.
+            latest_draft_message = (
+                self.db.query(AIMessage)
+                .filter(
+                    AIMessage.conversation_id == conversation.id,
+                    AIMessage.provider == "notice",
+                    AIMessage.message_type.in_(["notice_draft", "notice_refine"]),
+                )
+                .order_by(AIMessage.id.desc())
+                .first()
+            )
+
+            payload = {
+                "session_id": provider_session.provider_session_token,
+                "conversation_id": conversation.id,
+                "instruction": instruction,
+                "current_draft": latest_draft_message.answer if latest_draft_message else "",
+            }
+            response = await self._call_notice_vendor_with_recovery(
+                conversation, provider_session, lambda: self.ai_service.notice_refine(payload)
+            )
             self._raise_if_pipeline_error(response)
 
             new_revision = int(meta.get("revision") or 1) + 1

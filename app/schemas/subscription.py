@@ -55,6 +55,10 @@ class SubscriptionResponse(BaseModel):
 
     id: int
     user_id: int
+    # Populated by the route from sub.user — not a Subscription column, so
+    # these stay None if that transient attribute was never set.
+    user_name: Optional[str] = None
+    user_email: Optional[str] = None
     plan_id: str
     plan_name: str
     billing_cycle: str
@@ -111,13 +115,19 @@ class PaymentResponse(BaseModel):
     status: str
     order_id: str
     gateway_txn_id: Optional[str]
+    plan_id: str
     plan_name: str
     base_price: Decimal
+    gst_rate: Decimal
     gst_amount: Decimal
     payable_amount: Decimal
     currency: str
+    customer_name: Optional[str] = None
+    customer_email: Optional[str] = None
+    customer_mobile: Optional[str] = None
     invoice_number: Optional[str]
     receipt_number: Optional[str]
+    payment_notes: Optional[str] = None
     paid_at: Optional[datetime]
     created_at: datetime
 
