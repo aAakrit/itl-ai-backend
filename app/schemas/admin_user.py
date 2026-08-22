@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
@@ -45,7 +45,8 @@ class UserListItem(BaseModel):
     last_login: Optional[datetime] = None
     created_at: datetime
 
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        orm_mode = True
 
 class UserListResponse(BaseModel):
     items: list[UserListItem]
@@ -82,7 +83,8 @@ class UserDetailResponse(BaseModel):
     updated_at: Optional[datetime] = None
     last_login: Optional[datetime] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        orm_mode = True
 
 class AdminActionResponse(BaseModel):
     success: bool

@@ -31,7 +31,7 @@ def get_db():
 
 def _enrich(sub):
     """Attaches the owning user's name/email as transient attributes so
-    SubscriptionResponse.model_validate can pick them up — see the
+    SubscriptionResponse.from_orm can pick them up — see the
     user_name/user_email fields on that schema."""
     sub.user_name = sub.user.name if sub.user else None
     sub.user_email = sub.user.email if sub.user else None
@@ -66,7 +66,7 @@ def list_subscriptions(
     )
     return {
         **result,
-        "items": [SubscriptionResponse.model_validate(_enrich(s)) for s in result["items"]],
+        "items": [SubscriptionResponse.from_orm(_enrich(s)) for s in result["items"]],
     }
 
 

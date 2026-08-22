@@ -48,7 +48,7 @@ def list_payments(
     )
     return {
         **result,
-        "items": [PaymentResponse.model_validate(p) for p in result["items"]],
+        "items": [PaymentResponse.from_orm(p) for p in result["items"]],
     }
 
 

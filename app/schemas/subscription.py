@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 # =============================================================================
@@ -19,9 +19,9 @@ class SubscriptionCreateManual(BaseModel):
 
     user_id: int
     plan_id: str = Field(..., description="Matches a CMS pricingPlans[].id")
-    billing_cycle: str = Field("monthly", pattern="^(monthly|yearly)$")
+    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
 
-    source: str = Field("manual", pattern="^(manual|complimentary)$")
+    source: str = Field("manual", regex="^(manual|complimentary)$")
 
     # Optional overrides — if omitted, computed from CMS price + 18% GST.
     override_base_price: Optional[Decimal] = None
@@ -35,8 +35,8 @@ class SubscriptionUpdate(BaseModel):
     """Admin edits to an existing subscription — every field optional/partial."""
 
     plan_id: Optional[str] = None
-    billing_cycle: Optional[str] = Field(None, pattern="^(monthly|yearly)$")
-    status: Optional[str] = Field(None, pattern="^(pending|active|suspended|cancelled|expired)$")
+    billing_cycle: Optional[str] = Field(None, regex="^(monthly|yearly)$")
+    status: Optional[str] = Field(None, regex="^(pending|active|suspended|cancelled|expired)$")
     start_date: Optional[datetime] = None
     expiry_date: Optional[datetime] = None
     renewal_date: Optional[datetime] = None
@@ -51,7 +51,8 @@ class SubscriptionExtend(BaseModel):
 
 
 class SubscriptionResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        orm_mode = True
 
     id: int
     user_id: int
@@ -85,7 +86,7 @@ class PaymentInitiateRequest(BaseModel):
     """User-initiated checkout — starts a Paytm transaction."""
 
     plan_id: str
-    billing_cycle: str = Field("monthly", pattern="^(monthly|yearly)$")
+    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
 
 
 class PaymentInitiateResponse(BaseModel):
@@ -100,13 +101,14 @@ class CashPaymentCreate(BaseModel):
 
     user_id: int
     plan_id: str
-    billing_cycle: str = Field("monthly", pattern="^(monthly|yearly)$")
+    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
     override_base_price: Optional[Decimal] = None
     payment_notes: Optional[str] = None
 
 
 class PaymentResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        orm_mode = True
 
     id: int
     user_id: int
@@ -141,12 +143,13 @@ class AIUsageLimitUpdate(BaseModel):
     monthly_limit: Optional[int] = None
     yearly_limit: Optional[int] = None
     token_balance: Optional[int] = None
-    reset_frequency: Optional[str] = Field(None, pattern="^(daily|weekly|monthly|yearly|manual|on_renewal)$")
+    reset_frequency: Optional[str] = Field(None, regex="^(daily|weekly|monthly|yearly|manual|on_renewal)$")
     reason: Optional[str] = None
 
 
 class AIUsageLimitResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    class Config:
+        orm_mode = True
 
     user_id: int
     daily_limit: Optional[int]
