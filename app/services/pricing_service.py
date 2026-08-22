@@ -42,12 +42,19 @@ def resolve_plan(db: Session, plan_id: str, billing_cycle: str = "monthly") -> d
     for the given plan, read live from the CMS pricing page.
     """
 
-    page = cms_page_service.get_page(db, "pricing")
+    try:
+        page = cms_page_service.get_page(db, "pricing")
+    except HTTPException as e:
+        if e.status_code == 404:
+            raise HTTPException(status_code=503, detail="Pricing page is not configured yet.")
+        raise
 
-    if not page or not isinstance(page.content, dict):
+    content = page.get("content") if isinstance(page, dict) else getattr(page, "content", None)
+
+    if not page or not isinstance(content, dict):
         raise HTTPException(status_code=503, detail="Pricing page is not configured yet.")
 
-    plans = page.content.get("pricingPlans") or []
+    plans = content.get("pricingPlans") or []
 
     plan = next(
         (p for p in plans if str(_first_present(p, CANDIDATE_ID_KEYS)) == str(plan_id)),
