@@ -1,22 +1,16 @@
 """
-Payment service — admin listing and manual/cash payment recording.
-
-Online (Paytm) payments belong to the not-yet-built user-facing checkout
-flow (app/services/paytm_service.py has the gateway plumbing only; there is
-no route wired up to actually create a Payment row from it yet). This
-module covers the admin side that IS wired up end-to-end:
-
-  * browsing payment history (list/get)
-  * recording an offline/cash payment, which activates a subscription
-    exactly the way a successful online payment would
+Payment service — admin listing, manual/cash payment recording, and the
+Paytm online checkout flow (initiate -> gateway -> callback -> finalize).
 
 Cash payments reuse subscription_service.create_manual so both flows
-produce identical, consistent subscription records — pricing snapshot,
-audit log entry, and `user.plan` update all happen in one place.
+produce identical, consistent subscription records. Paytm payments use
+their own activation path (_activate_subscription_for_payment) since they
+go through finalize_paytm_payment rather than the admin-only
+SubscriptionCreateManual schema — see that function's docstring.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import HTTPException
@@ -24,9 +18,10 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.payment import Payment
+from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
-from app.services import subscription_service
+from app.services import pricing_service, subscription_service
 from app.services.audit_service import log_action
 
 PAYMENT_STATUSES = {"pending", "success", "failed", "refunded"}
@@ -149,6 +144,171 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
         },
         reason=payload.payment_notes,
     )
+
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+# =============================================================================
+# Paytm checkout flow
+#
+# Payment.gateway_response is used to stash a small amount of internal
+# bookkeeping (billing_cycle, the txnToken, raw gateway payloads) between
+# initiate and finalize — merged (never overwritten wholesale) on every
+# update so nothing added earlier is lost. This avoids a schema migration
+# for a single extra field, at the cost of that data living in a JSON blob
+# instead of a column; fine for what it's used for (debugging + one lookup
+# at finalize time), not something queried on.
+# =============================================================================
+
+def _new_order_id() -> str:
+    return f"ITL-{uuid.uuid4().hex[:20].upper()}"
+
+
+def create_paytm_payment(db: Session, user: User, plan_id: str, billing_cycle: str) -> Payment:
+    """Creates a pending Payment row for a checkout attempt. The route then
+    calls paytm_service.initiate_transaction and records the result via
+    record_gateway_init."""
+
+    pricing = pricing_service.resolve_plan(db, plan_id, billing_cycle)
+
+    payment = Payment(
+        user_id=user.id,
+        gateway="paytm",
+        status="pending",
+        order_id=_new_order_id(),
+        plan_id=pricing["plan_id"],
+        plan_name=pricing["plan_name"],
+        base_price=pricing["base_price"],
+        gst_rate=pricing["gst_rate"],
+        gst_amount=pricing["gst_amount"],
+        payable_amount=pricing["payable_amount"],
+        currency="INR",
+        customer_name=user.name,
+        customer_email=user.email,
+        customer_mobile=user.mobile,
+        gateway_response={"billing_cycle": billing_cycle},
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def record_gateway_init(db: Session, payment: Payment, txn_token: str, raw_response: dict) -> Payment:
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "txn_token": txn_token,
+        "init_response": raw_response,
+    }
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def mark_init_failed(db: Session, payment: Payment, reason: str) -> Payment:
+    payment.status = "failed"
+    payment.gateway_response = {**(payment.gateway_response or {}), "init_error": reason}
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def get_by_order_id(db: Session, order_id: str) -> Payment:
+    payment = db.query(Payment).filter(Payment.order_id == order_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    return payment
+
+
+def _activate_subscription_for_payment(db: Session, payment: Payment, billing_cycle: str) -> Subscription:
+    """Activates a subscription from a successful Paytm payment, using the
+    pricing snapshot already on the Payment row (what the user actually
+    paid) rather than a fresh CMS lookup."""
+
+    start = datetime.utcnow()
+    expiry = start + timedelta(days=subscription_service.CYCLE_DAYS.get(billing_cycle, 30))
+
+    sub = Subscription(
+        user_id=payment.user_id,
+        plan_id=payment.plan_id,
+        plan_name=payment.plan_name,
+        billing_cycle=billing_cycle,
+        base_price=payment.base_price,
+        gst_rate=payment.gst_rate,
+        gst_amount=payment.gst_amount,
+        payable_amount=payment.payable_amount,
+        status="active",
+        source="online",
+        start_date=start,
+        expiry_date=expiry,
+        notes=f"Activated by Paytm payment {payment.order_id}",
+    )
+    db.add(sub)
+    db.flush()
+
+    user = db.query(User).filter(User.id == payment.user_id).first()
+    if user:
+        user.plan = sub.plan_name
+
+    return sub
+
+
+def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) -> Payment:
+    """
+    Called only after a server-to-server call to Paytm's Transaction Status
+    API (the sole trustworthy source — see paytm_service module docstring).
+    Marks the Payment success/failed and, on success, activates a
+    Subscription. Idempotent — a payment already marked "success" is
+    returned as-is rather than double-activating a second subscription
+    (Paytm may deliver the callback more than once).
+    """
+
+    payment = get_by_order_id(db, order_id)
+
+    if payment.status == "success":
+        return payment
+
+    body = status_response.get("body", {}) if isinstance(status_response, dict) else {}
+    result_info = body.get("resultInfo", {}) if isinstance(body, dict) else {}
+    txn_status = result_info.get("resultStatus")  # TXN_SUCCESS | TXN_FAILURE | PENDING
+
+    payment.gateway_txn_id = body.get("txnId") or payment.gateway_txn_id
+    payment.gateway_response = {**(payment.gateway_response or {}), "status_response": status_response}
+
+    if txn_status == "TXN_SUCCESS":
+        payment.status = "success"
+        payment.paid_at = datetime.utcnow()
+        db.flush()  # allocate payment.id if this is somehow still transient
+        payment.invoice_number = payment.invoice_number or f"INV-{payment.id:06d}"
+        payment.receipt_number = payment.receipt_number or f"RCPT-{payment.id:06d}"
+
+        billing_cycle = (payment.gateway_response or {}).get("billing_cycle", "monthly")
+        subscription = _activate_subscription_for_payment(db, payment, billing_cycle)
+        payment.subscription_id = subscription.id
+
+        log_action(
+            db,
+            actor_id=payment.user_id,
+            action="payment.paytm_success",
+            target_type="payment",
+            target_id=payment.id,
+            new_value={"order_id": order_id, "subscription_id": subscription.id},
+        )
+    elif txn_status == "TXN_FAILURE":
+        payment.status = "failed"
+        log_action(
+            db,
+            actor_id=payment.user_id,
+            action="payment.paytm_failed",
+            target_type="payment",
+            target_id=payment.id,
+            new_value={"order_id": order_id, "reason": result_info.get("resultMsg")},
+        )
+    # else: still PENDING on Paytm's side — leave status as "pending" so a
+    # later recheck can pick it up; don't guess at an outcome Paytm hasn't
+    # confirmed yet.
 
     db.commit()
     db.refresh(payment)

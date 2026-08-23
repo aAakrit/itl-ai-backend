@@ -21,6 +21,7 @@ from app.routes.books import router as admin_books
 from app.routes.ai import router as ai_router
 from app.routes.subscription import router as admin_subscription_router
 from app.routes.payment import router as admin_payment_router
+from app.routes.payment import checkout_router as payment_checkout_router
 from app.models.ai import (
     AIConversation,
     AIProviderSession,
@@ -87,3 +88,4 @@ app.include_router(admin_books)
 app.include_router(ai_router)
 app.include_router(admin_subscription_router)
 app.include_router(admin_payment_router)
+app.include_router(payment_checkout_router)
