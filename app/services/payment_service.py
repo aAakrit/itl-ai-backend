@@ -22,6 +22,7 @@ from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
 from app.services import pricing_service, subscription_service
+from app.services import email_service
 from app.services.audit_service import log_action
 
 PAYMENT_STATUSES = {"pending", "success", "failed", "refunded"}
@@ -147,6 +148,15 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
 
     db.commit()
     db.refresh(payment)
+
+    email_service.send_payment_receipt_email(
+        to=user.email,
+        name=user.name,
+        plan_name=payment.plan_name,
+        amount=str(payment.payable_amount),
+        order_id=payment.order_id,
+    )
+
     return payment
 
 
@@ -312,4 +322,14 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
 
     db.commit()
     db.refresh(payment)
+
+    if payment.status == "success":
+        email_service.send_payment_receipt_email(
+            to=payment.customer_email,
+            name=payment.customer_name or "there",
+            plan_name=payment.plan_name,
+            amount=str(payment.payable_amount),
+            order_id=payment.order_id,
+        )
+
     return payment

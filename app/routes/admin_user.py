@@ -2,13 +2,17 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+import io
 
 from app.db import SessionLocal
 from app.models.user import User
 from app.routes.auth import require_admin
 from app.schemas.admin_user import UserUpdate
 from app.services import admin_user as service
+from app.services import user_export_service
 
 router = APIRouter(
     prefix="/admin/users",
@@ -22,6 +26,41 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+class UserExportRequest(BaseModel):
+    user_ids: list[int] = Field(..., min_items=1, max_items=2000)
+    format: str = Field(..., description="xlsx | docx | pdf")
+    detail: str = Field("short", description="short | full")
+
+
+@router.post("/export")
+def export_users(
+    payload: UserExportRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if payload.format not in ("xlsx", "docx", "pdf"):
+        raise HTTPException(status_code=400, detail="format must be one of: xlsx, docx, pdf")
+    if payload.detail not in ("short", "full"):
+        raise HTTPException(status_code=400, detail="detail must be one of: short, full")
+
+    rows = (
+        service.get_users_full_by_ids(db, payload.user_ids)
+        if payload.detail == "full"
+        else service.get_users_by_ids(db, payload.user_ids)
+    )
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="None of the selected users could be found.")
+
+    file_bytes, content_type, filename = user_export_service.build_export(rows, payload.format, payload.detail)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("")

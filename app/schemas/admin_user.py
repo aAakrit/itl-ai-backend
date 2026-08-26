@@ -9,7 +9,7 @@ class UserUpdate(BaseModel):
 
     mobile: Optional[str] = None
     telephone: Optional[str] = None
-    fax: Optional[str] = None
+    gstin: Optional[str] = None
 
     address: Optional[str] = None
     city: Optional[str] = None
@@ -65,7 +65,7 @@ class UserDetailResponse(BaseModel):
 
     mobile: Optional[str] = None
     telephone: Optional[str] = None
-    fax: Optional[str] = None
+    gstin: Optional[str] = None
 
     address: Optional[str] = None
     city: Optional[str] = None

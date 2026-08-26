@@ -10,7 +10,7 @@ class UserRegister(BaseModel):
     mobile: str
 
     telephone: str | None = None
-    fax: str | None = None
+    gstin: str | None = None
 
     firm: str | None = None
 
@@ -31,7 +31,7 @@ class UserUpdate(BaseModel):
 
     mobile: str | None = None
     telephone: str | None = None
-    fax: str | None = None
+    gstin: str | None = None
 
     firm: str | None = None
 

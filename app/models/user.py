@@ -21,7 +21,7 @@ class User(Base):
     # Contact
     mobile = Column(String(20))
     telephone = Column(String(20))
-    fax = Column(String(20))
+    gstin = Column(String(20))
 
     address = Column(String(500))
     city = Column(String(100))

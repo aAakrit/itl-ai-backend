@@ -12,6 +12,7 @@ from app.models.subscription import Subscription
 from app.models.payment import Payment
 from app.models.ai_usage import AIUsageLimit
 from app.models.audit_log import AuditLog
+from app.models.password_reset_otp import PasswordResetOtp
 
 # Routes
 from app.routes.auth import router as auth_router

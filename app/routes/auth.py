@@ -1,22 +1,28 @@
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.models.user import User
 from app.models.session import AuthSession
+from app.models.password_reset_otp import PasswordResetOtp
 
 from app.schemas.user import UserLogin, UserRegister
 
+from app.services import email_service
 from app.services.auth_utils import hash_password, verify_password
 from app.services.jwt import (
     SECRET_KEY,
     ALGORITHM,
     create_token,
 )
+
+OTP_TTL_MINUTES = 10
+OTP_MAX_ATTEMPTS = 5
 
 router = APIRouter(
     prefix="/auth",
@@ -35,7 +41,7 @@ def get_db():
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 @router.post("/register")
-def register(user: UserRegister, db: Session = Depends(get_db)):
+def register(user: UserRegister, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
 
     existing = db.query(User).filter(User.email == user.email).first()
 
@@ -55,7 +61,7 @@ def register(user: UserRegister, db: Session = Depends(get_db)):
 
         mobile=user.mobile,
         telephone=user.telephone,
-        fax=user.fax,
+        gstin=user.gstin,
 
         address=user.address,
         city=user.city,
@@ -67,6 +73,8 @@ def register(user: UserRegister, db: Session = Depends(get_db)):
 
     db.add(new_user)
     db.commit()
+
+    background_tasks.add_task(email_service.send_registration_email, to=new_user.email, name=new_user.name)
 
     return {
         "success": True,
@@ -297,3 +305,133 @@ def require_admin(
         )
 
     return user
+
+
+# =============================================================================
+# Forgot password — OTP flow
+#
+# request -> emails a 6-digit code (always returns success, even for an
+#            unknown email, so this endpoint can't be used to enumerate
+#            registered addresses)
+# verify  -> checks the code without consuming it, for the UI's "OTP" step
+# reset   -> re-checks the SAME code (never trusts a prior verify call by
+#            itself) and only then updates the password, marking the code
+#            consumed and invalidating existing sessions
+# =============================================================================
+
+class PasswordOtpRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordOtpVerify(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class PasswordResetSubmit(BaseModel):
+    email: EmailStr
+    otp: str
+    password: str
+
+
+def _generate_otp() -> str:
+    import secrets
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _latest_valid_otp(db: Session, email: str) -> "PasswordResetOtp | None":
+    return (
+        db.query(PasswordResetOtp)
+        .filter(
+            PasswordResetOtp.email == email,
+            PasswordResetOtp.consumed_at.is_(None),
+            PasswordResetOtp.expires_at > datetime.utcnow(),
+        )
+        .order_by(PasswordResetOtp.created_at.desc())
+        .first()
+    )
+
+
+@router.post("/password/otp/request")
+def request_password_otp(
+    payload: PasswordOtpRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    user = db.query(User).filter(User.email == payload.email).first()
+
+    # Always the same response whether or not the account exists — the
+    # point of the generic message is to not leak which emails are
+    # registered.
+    generic_response = {"success": True, "message": "If that email is registered, a code has been sent."}
+
+    if not user:
+        return generic_response
+
+    code = _generate_otp()
+    otp_row = PasswordResetOtp(
+        user_id=user.id,
+        email=user.email,
+        code_hash=hash_password(code),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
+    )
+    db.add(otp_row)
+    db.commit()
+
+    background_tasks.add_task(
+        email_service.send_password_reset_otp_email,
+        to=user.email,
+        otp=code,
+        ttl_minutes=OTP_TTL_MINUTES,
+    )
+
+    return generic_response
+
+
+@router.post("/password/otp/verify")
+def verify_password_otp(payload: PasswordOtpVerify, db: Session = Depends(get_db)):
+    otp_row = _latest_valid_otp(db, payload.email)
+
+    if not otp_row or otp_row.attempts >= OTP_MAX_ATTEMPTS:
+        return {"ok": False}
+
+    if not verify_password(payload.otp, otp_row.code_hash):
+        otp_row.attempts += 1
+        db.commit()
+        return {"ok": False}
+
+    otp_row.verified_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/password/reset")
+def reset_password(payload: PasswordResetSubmit, db: Session = Depends(get_db)):
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    otp_row = _latest_valid_otp(db, payload.email)
+
+    if not otp_row or otp_row.attempts >= OTP_MAX_ATTEMPTS or not verify_password(payload.otp, otp_row.code_hash):
+        if otp_row:
+            otp_row.attempts += 1
+            db.commit()
+        raise HTTPException(status_code=400, detail="Invalid or expired code — please request a new one.")
+
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found.")
+
+    user.password = hash_password(payload.password)
+    user.updated_at = datetime.utcnow()
+    otp_row.consumed_at = datetime.utcnow()
+
+    # A password reset invalidates every existing session — anyone signed
+    # in elsewhere with the old password is signed out.
+    db.query(AuthSession).filter(AuthSession.user_id == user.id, AuthSession.is_active.is_(True)).update(
+        {"is_active": False, "invalidated_at": datetime.utcnow(), "invalidation_reason": "password_reset"}
+    )
+
+    db.commit()
+
+    return {"success": True, "message": "Password updated. Please sign in with your new password."}

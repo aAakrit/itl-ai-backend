@@ -33,3 +33,11 @@ PAYTM_ENV = os.getenv("PAYTM_ENV", "staging").lower()
 # Where the Paytm callback route redirects the browser back to once a
 # payment is finalized — the frontend's own return/receipt page.
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.incometaxlibrary.in/")
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "info.incometaxlibrary@gmail.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+EMAIL_FROM = os.getenv("EMAIL_FROM", "info.incometaxlibrary@gmail.com")
+EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Income Tax Library")

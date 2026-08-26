@@ -193,6 +193,81 @@ def _ai_summary(usage: Optional[AIUsageLimit]) -> dict:
     }
 
 
+def _build_user_row(user: User, subscription, payment, ai_usage) -> dict:
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "mobile": user.mobile,
+        "telephone": user.telephone,
+        "gstin": user.gstin,
+        "firm": user.firm,
+        "address": user.address,
+        "city": user.city,
+        "state": user.state,
+        "pin_code": user.pin_code,
+        "plan": subscription.plan_name if subscription else getattr(user, "plan", None),
+        "role": _role_name(user),
+        "status": user.status,
+        "last_login": getattr(user, "last_login", None),
+        "created_at": user.created_at,
+        "subscription": _subscription_summary(subscription),
+        "payment": _payment_summary(payment),
+        "ai_usage": _ai_summary(ai_usage),
+    }
+
+
+def _users_export_base_query(db: Session):
+    """Same joins get_users uses (current subscription, latest payment, AI
+    usage) — factored out so export can reuse them without pagination."""
+    current_sub_rank = _current_subscription_subquery(db)
+    latest_payment_rank = _latest_payment_subquery(db)
+    CurrentSubscription = aliased(Subscription)
+    LatestPayment = aliased(Payment)
+
+    query = (
+        db.query(User, CurrentSubscription, LatestPayment, AIUsageLimit)
+        .outerjoin(
+            current_sub_rank,
+            and_(
+                current_sub_rank.c.subscription_user_id == User.id,
+                current_sub_rank.c.subscription_rank == 1,
+            ),
+        )
+        .outerjoin(
+            CurrentSubscription,
+            CurrentSubscription.id == current_sub_rank.c.subscription_id,
+        )
+        .outerjoin(
+            latest_payment_rank,
+            and_(
+                latest_payment_rank.c.payment_user_id == User.id,
+                latest_payment_rank.c.payment_rank == 1,
+            ),
+        )
+        .outerjoin(
+            LatestPayment,
+            LatestPayment.id == latest_payment_rank.c.payment_id,
+        )
+        .outerjoin(AIUsageLimit, AIUsageLimit.user_id == User.id)
+    )
+    return query, CurrentSubscription, LatestPayment
+
+
+def get_users_by_ids(db: Session, user_ids: list[int]) -> list[dict]:
+    """Unpaginated fetch for a specific set of users — used by the export
+    endpoint so exported rows carry the same shape as the admin table."""
+    if not user_ids:
+        return []
+
+    query, _, _ = _users_export_base_query(db)
+    rows = query.filter(User.id.in_(user_ids)).all()
+    by_id = {user.id: _build_user_row(user, subscription, payment, ai_usage) for user, subscription, payment, ai_usage in rows}
+    # Preserve the order the caller asked for (e.g. the order rows were
+    # selected on-screen) rather than whatever order the DB returns.
+    return [by_id[uid] for uid in user_ids if uid in by_id]
+
+
 def get_users(
     db: Session,
     page: int,
@@ -368,29 +443,22 @@ def get_users(
 
     items = []
     for user, subscription, payment, ai_usage in rows:
-        items.append(
-            {
-                "id": user.id,
-                "name": user.name,
-                "email": user.email,
-                "mobile": user.mobile,
-                "firm": user.firm,
-                "address": user.address,
-                "city": user.city,
-                "state": user.state,
-                "pin_code": user.pin_code,
-                "plan": subscription.plan_name if subscription else getattr(user, "plan", None),
-                "role": _role_name(user),
-                "status": user.status,
-                "last_login": getattr(user, "last_login", None),
-                "created_at": user.created_at,
-                "subscription": _subscription_summary(subscription),
-                "payment": _payment_summary(payment),
-                "ai_usage": _ai_summary(ai_usage),
-            }
-        )
+        items.append(_build_user_row(user, subscription, payment, ai_usage))
 
     return {"items": items, "page": page, "limit": limit, "total": total}
+
+
+def get_users_full_by_ids(db: Session, user_ids: list[int]) -> list[dict]:
+    """Full-detail rows for export — one get_user_detail call per id.
+    Fine for the batch sizes an admin selects by hand from the table;
+    not intended for exporting the entire user base in one request."""
+    rows = []
+    for uid in user_ids:
+        try:
+            rows.append(get_user_detail(db, uid))
+        except HTTPException:
+            continue  # user deleted between selection and export — skip, don't fail the whole export
+    return rows
 
 
 def get_user(db: Session, user_id: int):
@@ -422,7 +490,7 @@ def get_user_detail(db: Session, user_id: int) -> dict:
         "email": user.email,
         "mobile": user.mobile,
         "telephone": user.telephone,
-        "fax": user.fax,
+        "gstin": user.gstin,
         "firm": user.firm,
         "address": user.address,
         "city": user.city,
@@ -472,7 +540,7 @@ def update_user(db: Session, user_id: int, payload: UserUpdate, admin_id: int):
         "firm",
         "mobile",
         "telephone",
-        "fax",
+        "gstin",
         "address",
         "city",
         "state",
