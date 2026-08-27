@@ -26,7 +26,6 @@ AI_RENDER_MARKDOWN = (
 
 PAYTM_MID = os.getenv("PAYTM_MID", "")
 PAYTM_MERCHANT_KEY = os.getenv("PAYTM_MERCHANT_KEY", "")
-PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE", "WEBSTAGING")
 PAYTM_CALLBACK_URL = os.getenv("PAYTM_CALLBACK_URL", "")
 PAYTM_ENV = os.getenv("PAYTM_ENV", "staging").lower()
 PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE") or ("DEFAULT" if PAYTM_ENV == "production" else "WEBSTAGING")

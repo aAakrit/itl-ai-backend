@@ -217,13 +217,17 @@ def record_gateway_init(db: Session, payment: Payment, txn_token: str, raw_respo
     return payment
 
 
-def mark_init_failed(db: Session, payment: Payment, reason: str) -> Payment:
+def mark_init_failed(db: Session, payment: Payment, reason: str, *, raw_response: Optional[dict] = None) -> Payment:
     """Paytm's application layer explicitly rejected the request (bad
     payload, invalid signature, business-rule rejection, etc). This is a
     terminal state for the attempt — retrying the identical request is
     expected to fail again the same way."""
     payment.status = "failed"
-    payment.gateway_response = {**(payment.gateway_response or {}), "init_error": reason}
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "init_error": reason,
+        **({"init_error_response": raw_response} if raw_response is not None else {}),
+    }
     db.commit()
     db.refresh(payment)
     return payment

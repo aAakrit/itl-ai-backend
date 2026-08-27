@@ -95,6 +95,16 @@ RESULT_CODE_MEANINGS = {
     "2023": "Repeat request is inconsistent with the original",
     "2100": "Link details are not valid",
     "00000900": "System error — Paytm's generic internal failure bucket; often a merchant-account/provisioning issue (MID not enabled for this API, key/environment mismatch, websiteName not recognized for this MID) rather than a request-formatting bug",
+    # 501 is NOT documented for initiateTransaction in Paytm's own current
+    # docs (paytmpayments.com/docs/api/initiate-transaction-api) — the
+    # code exists elsewhere in Paytm's ecosystem with DIFFERENT meanings
+    # per API (e.g. "bank declined" in a post-payment transaction-status
+    # context, generic "System Error" in a refund-status context), neither
+    # of which is safe to assume applies here. Recorded as observed, not
+    # as a confirmed meaning — see paytm_service module docs/tests for the
+    # investigation that ruled out request construction and checksum as
+    # the cause before landing here.
+    "501": "Undocumented for initiateTransaction specifically — observed in staging as a generic \"System Error\"; not confirmed to mean checksum, amount, or parameter issues (those have their own distinct codes). Most consistent with a merchant-account/provisioning-side cause.",
 }
 
 
