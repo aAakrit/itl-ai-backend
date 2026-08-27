@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -165,8 +166,25 @@ async def initiate_payment(
 
     if result_info.get("resultStatus") != "S":
         reason = result_info.get("resultMsg", "Paytm rejected the request.")
-        logger.error("Paytm resultStatus != S for order %s: %s", payment.order_id, reason)
-        service.mark_init_failed(db, payment, reason)
+        result_code = result_info.get("resultCode")
+        code_meaning = paytm_service.describe_result_code(result_code)
+        # "System Error" alone isn't diagnosable — resultCode is Paytm's
+        # actual machine-readable error taxonomy, and the full body can
+        # carry extra context resultInfo doesn't. mid/websiteName/orderId
+        # aren't secrets (mid is a public merchant identifier); nothing
+        # here includes the merchant key or txnToken.
+        logger.error(
+            "Paytm rejected initiateTransaction for order %s | resultCode=%s (%s) | resultMsg=%s | mid=%s | websiteName=%s | full body=%s",
+            payment.order_id,
+            result_code,
+            code_meaning,
+            reason,
+            paytm_service.PAYTM_MID,
+            paytm_service.PAYTM_WEBSITE,
+            json.dumps(body)[:2000],
+        )
+        stored_reason = f"{reason} (resultCode={result_code}: {code_meaning})" if result_code else reason
+        service.mark_init_failed(db, payment, stored_reason, raw_response=result)
         raise HTTPException(
             status_code=502,
             detail={

@@ -70,6 +70,39 @@ BASE_URL = "https://secure.paytmpayments.com" if PAYTM_ENV == "production" else 
 # one of their SDKs, not a secret.
 _IV = b"@@@@&&&&####$$$$"
 
+# initiateTransaction resultCode -> human meaning, straight from Paytm's
+# own docs (paytmpayments.com/docs/jscheckout-initiate-payment). resultMsg
+# alone is too generic to act on ("System Error" covers a whole bucket of
+# causes) — pairing the numeric code with what it actually means turns the
+# next failure into an immediate diagnosis instead of another guess-and-log
+# round trip.
+RESULT_CODE_MEANINGS = {
+    "0000": "Success",
+    "0002": "Success (idempotent — already processed)",
+    "196": "Amount exceeds the allowed limit",
+    "1001": "Request parameters are not valid",
+    "1006": "Session has expired",
+    "1007": "Missing mandatory element — a required field is absent from the request body",
+    "1008": "Pipe character is not allowed in a field value",
+    "1009": "Promo code request is not valid",
+    "1011": "Invalid promo param",
+    "1012": "Promo amount exceeds transaction amount",
+    "2004": "SSO token is invalid",
+    "2005": "Checksum provided is invalid — signature/key mismatch",
+    "2007": "Transaction amount is invalid",
+    "2013": "MID in the query param doesn't match the mid in the request body",
+    "2014": "orderId in the query param doesn't match the orderId in the request body",
+    "2023": "Repeat request is inconsistent with the original",
+    "2100": "Link details are not valid",
+    "00000900": "System error — Paytm's generic internal failure bucket; often a merchant-account/provisioning issue (MID not enabled for this API, key/environment mismatch, websiteName not recognized for this MID) rather than a request-formatting bug",
+}
+
+
+def describe_result_code(result_code: Optional[str]) -> str:
+    if not result_code:
+        return "unknown"
+    return RESULT_CODE_MEANINGS.get(str(result_code), "undocumented result code")
+
 # HTTP statuses treated as transient/infra-level and safe to retry — a
 # narrow set on purpose. 500 is deliberately excluded: in practice a Paytm
 # 500 is far more often an application-level rejection of the payload than
