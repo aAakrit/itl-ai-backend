@@ -29,6 +29,7 @@ PAYTM_MERCHANT_KEY = os.getenv("PAYTM_MERCHANT_KEY", "")
 PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE", "WEBSTAGING")
 PAYTM_CALLBACK_URL = os.getenv("PAYTM_CALLBACK_URL", "")
 PAYTM_ENV = os.getenv("PAYTM_ENV", "staging").lower()
+PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE") or ("DEFAULT" if PAYTM_ENV == "production" else "WEBSTAGING")
 
 # Where the Paytm callback route redirects the browser back to once a
 # payment is finalized — the frontend's own return/receipt page.

@@ -227,9 +227,20 @@ def _generate_signature_by_string(data: str, key: str) -> str:
 
 
 def _params_to_string(params: dict[str, Any]) -> str:
-    """Sorted-by-key, pipe-joined VALUES — the classic flat-form checksum input."""
+    """Sorted-by-key, pipe-joined VALUES — the classic flat-form checksum
+    input, used for the callback Paytm posts to callbackUrl.
+
+    Matches Paytm's own reference getStringByParams exactly: a null/missing
+    value becomes an empty string IN PLACE, not a skipped entry. Skipping
+    would shift every value after it by one position in the pipe-joined
+    string, producing a completely different (and wrong) string the moment
+    any field is null — which silently breaks verification for any
+    callback that happens to have one."""
     ordered = dict(sorted(params.items()))
-    return "|".join(str(v) for v in ordered.values() if v is not None and v != "null")
+    return "|".join(
+        "" if v is None or str(v).lower() == "null" else str(v)
+        for v in ordered.values()
+    )
 
 
 def _verify_signature_by_params(params: dict[str, Any], key: str, checksum: str) -> bool:
