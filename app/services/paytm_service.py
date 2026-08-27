@@ -36,10 +36,12 @@ Implemented directly (via `cryptography`) rather than the unmaintained
 depends on the abandoned `pycrypto`.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import random
 import string
 from typing import Any, Optional
@@ -54,12 +56,129 @@ from app.config import (
     PAYTM_ENV,
 )
 
-# Paytm's own staging/production API hosts.
-BASE_URL = "https://securegw.paytm.in" if PAYTM_ENV == "production" else "https://securegw-stage.paytm.in"
+logger = logging.getLogger(__name__)
+
+# Paytm's own staging/production API + JS Checkout hosts. Confirmed against
+# current docs (paytmpayments.com/docs/jscheckout-initiate-payment) —
+# NOT securegw(-stage).paytm.in, which is the legacy "Standard Checkout"
+# host and is documented as deprecated. Using the old host is what produced
+# the 503s: requests either never reached the current application layer or
+# hit a sunset/redirecting edge.
+BASE_URL = "https://secure.paytmpayments.com" if PAYTM_ENV == "production" else "https://securestage.paytmpayments.com"
 
 # Paytm's fixed IV for the checksum's AES-128-CBC step — published in every
 # one of their SDKs, not a secret.
 _IV = b"@@@@&&&&####$$$$"
+
+# HTTP statuses treated as transient/infra-level and safe to retry — a
+# narrow set on purpose. 500 is deliberately excluded: in practice a Paytm
+# 500 is far more often an application-level rejection of the payload than
+# a transient blip, so it's surfaced as a (non-retried) gateway error
+# rather than silently retried.
+_RETRYABLE_STATUSES = {502, 503, 504}
+_MAX_ATTEMPTS = 3
+_BACKOFF_SECONDS = (0.5, 1.5)  # delay before attempt 2, before attempt 3
+
+
+class PaytmError(Exception):
+    """Base for anything that goes wrong talking to Paytm. Carries the raw
+    status/body (when available) so callers can log or inspect it without
+    parsing exception strings."""
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None, body: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+class PaytmGatewayError(PaytmError):
+    """Transient — Paytm's gateway itself was unavailable (5xx we retried
+    and still failed, a timeout, or a connection error). The request was
+    never confirmed accepted OR rejected by Paytm. Safe to retry later
+    with a fresh call; the caller should NOT treat this as a declined
+    payment."""
+
+
+class PaytmRequestError(PaytmError):
+    """Non-transient — Paytm's application layer responded and explicitly
+    rejected the request (4xx, or a 5xx outside the retryable set). Retrying
+    the identical request is expected to fail the same way again."""
+
+
+def _safe_body_preview(response: httpx.Response, limit: int = 2000) -> str:
+    """Best-effort text of a response body for logging. Paytm's error
+    bodies describe Paytm-side problems (bad mid, bad signature, etc.) —
+    they do not echo back the merchant key or other secrets we sent, so
+    this is safe to log. Truncated defensively regardless."""
+    try:
+        text = response.text
+    except Exception:
+        return "<unreadable body>"
+    return text[:limit]
+
+
+async def _post_with_retry(url: str, *, json_payload: dict, params: Optional[dict] = None) -> dict:
+    """POSTs to a Paytm endpoint, retrying a narrow set of transient
+    failures with exponential backoff, and returns the parsed JSON body on
+    success.
+
+    Retrying is safe here specifically because every call site passes the
+    *same* orderId on every attempt (generated once, before this is ever
+    called) and Paytm's initiateTransaction / order-status APIs are
+    idempotent per orderId at this stage — no money moves and no duplicate
+    order is created by calling them again with an orderId that hasn't
+    produced a completed transaction yet.
+    """
+
+    last_error: Optional[PaytmError] = None
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, params=params, json=json_payload)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_error = PaytmGatewayError(f"Network error calling Paytm: {e}")
+            logger.warning("Paytm request network error (attempt %s/%s): %s — %s", attempt, _MAX_ATTEMPTS, url, e)
+        else:
+            if response.status_code < 400:
+                try:
+                    return response.json()
+                except ValueError:
+                    # 2xx with an unparseable body — Paytm's application
+                    # layer responded but not with anything we can use.
+                    # Not something a retry fixes.
+                    body = _safe_body_preview(response)
+                    logger.error("Paytm returned %s with a malformed body — %s: %s", response.status_code, url, body)
+                    raise PaytmGatewayError(
+                        "Paytm returned an unreadable response.",
+                        status_code=response.status_code,
+                        body=body,
+                    )
+
+            body = _safe_body_preview(response)
+            logger.warning("Paytm HTTP status: %s | url: %s | response body: %s", response.status_code, url, body)
+
+            if response.status_code in _RETRYABLE_STATUSES:
+                last_error = PaytmGatewayError(
+                    f"Paytm gateway returned {response.status_code}.",
+                    status_code=response.status_code,
+                    body=body,
+                )
+            else:
+                # A definitive answer from Paytm's application layer —
+                # retrying the same payload will not change it.
+                raise PaytmRequestError(
+                    f"Paytm rejected the request ({response.status_code}).",
+                    status_code=response.status_code,
+                    body=body,
+                )
+
+        if attempt < _MAX_ATTEMPTS:
+            await asyncio.sleep(_BACKOFF_SECONDS[attempt - 1])
+
+    # Retries exhausted — still only a transient/gateway problem, never
+    # escalated to "rejected".
+    raise last_error or PaytmGatewayError("Paytm gateway unavailable after retries.")
 
 
 # =============================================================================
@@ -144,6 +263,11 @@ async def initiate_transaction(
     """
     POST /theia/api/v1/initiateTransaction — returns Paytm's txnToken,
     which the frontend uses to open Paytm's checkout for this order.
+
+    Raises PaytmGatewayError for transient failures (retried internally
+    first) or PaytmRequestError if Paytm's application layer explicitly
+    rejected the request — see _post_with_retry's docstring for why
+    retrying with this same order_id is safe.
     """
 
     body = {
@@ -164,20 +288,20 @@ async def initiate_transaction(
     checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
     payload = {"body": body, "head": {"signature": checksum}}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            f"{BASE_URL}/theia/api/v1/initiateTransaction",
-            params={"mid": PAYTM_MID, "orderId": order_id},
-            json=payload,
-        )
-        response.raise_for_status()
-        return response.json()
+    return await _post_with_retry(
+        f"{BASE_URL}/theia/api/v1/initiateTransaction",
+        json_payload=payload,
+        params={"mid": PAYTM_MID, "orderId": order_id},
+    )
 
 
-def checkout_url(order_id: str) -> str:
-    """Full-page hosted checkout — the frontend auto-submits a form
-    (mid, orderId, txnToken) as a POST to this URL."""
-    return f"{BASE_URL}/theia/api/v1/showPaymentPage?mid={PAYTM_MID}&orderId={order_id}"
+def checkout_script_url() -> str:
+    """The JS Checkout SDK script — current recommended integration
+    (paytmpayments.com/docs/jscheckout-invoke-payment). Renders an iframe
+    on the merchant's own page rather than redirecting to a Paytm-hosted
+    page; the deprecated `showPaymentPage` full-page redirect this used to
+    point at is no longer the recommended flow."""
+    return f"{BASE_URL}/merchantpgpui/checkoutjs/merchants/{PAYTM_MID}.js"
 
 
 # =============================================================================
@@ -198,14 +322,13 @@ def verify_callback_checksum(callback_params: dict[str, Any]) -> bool:
 # =============================================================================
 
 async def verify_transaction_status(order_id: str) -> dict:
-    """POST /v3/order/status — the authoritative check."""
+    """POST /v3/order/status — the authoritative check. Retries transient
+    failures the same as initiate_transaction; this is a read-only check
+    so retrying is unambiguously safe."""
 
     body = {"mid": PAYTM_MID, "orderId": order_id}
     body_json = json.dumps(body, separators=(",", ":"))
     checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
     payload = {"body": body, "head": {"signature": checksum}}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(f"{BASE_URL}/v3/order/status", json=payload)
-        response.raise_for_status()
-        return response.json()
+    return await _post_with_retry(f"{BASE_URL}/v3/order/status", json_payload=payload)

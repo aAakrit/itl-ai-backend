@@ -107,23 +107,90 @@ async def initiate_payment(
             email=user.email,
             mobile=user.mobile,
         )
-    except Exception as e:
-        logger.exception("Paytm initiateTransaction failed for order %s", payment.order_id)
+    except paytm_service.PaytmGatewayError as e:
+        # Transient — Paytm's gateway itself was unreachable/erroring after
+        # retries. Nothing about this payment is known to be wrong, so it
+        # is NOT marked "failed"; the same order can be retried.
+        logger.warning(
+            "Paytm gateway unavailable for order %s (status=%s): %s",
+            payment.order_id, e.status_code, e,
+        )
+        service.mark_init_gateway_error(db, payment, str(e), status_code=e.status_code, body=e.body)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "PAYMENT_GATEWAY_UNAVAILABLE",
+                "message": "Payment gateway is temporarily unavailable. Please try again in a moment.",
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": True,
+            },
+        )
+    except paytm_service.PaytmRequestError as e:
+        # Definitive — Paytm's application layer rejected the request.
+        # Retrying the identical request is expected to fail the same way.
+        logger.error(
+            "Paytm rejected initiateTransaction for order %s (status=%s): %s",
+            payment.order_id, e.status_code, e,
+        )
         service.mark_init_failed(db, payment, str(e))
-        raise HTTPException(status_code=502, detail="Couldn't reach Paytm — please try again.")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "PAYMENT_INITIATION_FAILED",
+                "message": "Paytm couldn't start this transaction. Please try again or use a different plan.",
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": False,
+            },
+        )
+    except Exception as e:
+        # Anything unexpected (bug in our own code, etc) — don't guess at
+        # what happened, but also don't leak internals to the frontend.
+        logger.exception("Unexpected error initiating payment for order %s", payment.order_id)
+        service.mark_init_gateway_error(db, payment, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PAYMENT_INITIATION_ERROR",
+                "message": "Something went wrong starting checkout. Please try again.",
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": True,
+            },
+        )
 
     body = result.get("body", {}) if isinstance(result, dict) else {}
     result_info = body.get("resultInfo", {}) if isinstance(body, dict) else {}
 
     if result_info.get("resultStatus") != "S":
         reason = result_info.get("resultMsg", "Paytm rejected the request.")
+        logger.error("Paytm resultStatus != S for order %s: %s", payment.order_id, reason)
         service.mark_init_failed(db, payment, reason)
-        raise HTTPException(status_code=502, detail=reason)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "PAYMENT_INITIATION_FAILED",
+                "message": reason,
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": False,
+            },
+        )
 
     txn_token = body.get("txnToken")
     if not txn_token:
         service.mark_init_failed(db, payment, "Paytm did not return a txnToken.")
-        raise HTTPException(status_code=502, detail="Paytm did not return a transaction token.")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "PAYMENT_INITIATION_FAILED",
+                "message": "Paytm did not return a transaction token.",
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": False,
+            },
+        )
 
     service.record_gateway_init(db, payment, txn_token, result)
 
@@ -135,7 +202,11 @@ async def initiate_payment(
             "mid": paytm_service.PAYTM_MID,
             "orderId": payment.order_id,
             "txnToken": txn_token,
-            "checkoutUrl": paytm_service.checkout_url(payment.order_id),
+            # JS Checkout (current recommended flow) — the frontend loads
+            # this script and calls window.Paytm.CheckoutJS.init/.invoke().
+            # Not a redirect URL; there's no page navigation involved.
+            "scriptUrl": paytm_service.checkout_script_url(),
+            "isStaging": paytm_service.PAYTM_ENV != "production",
         },
     )
 
@@ -211,5 +282,19 @@ async def recheck_payment(
     if payment.status == "success":
         return payment
 
-    status_response = await paytm_service.verify_transaction_status(order_id)
+    try:
+        status_response = await paytm_service.verify_transaction_status(order_id)
+    except paytm_service.PaytmError as e:
+        logger.warning("Paytm status recheck failed for order %s (status=%s): %s", order_id, e.status_code, e)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "PAYMENT_STATUS_CHECK_UNAVAILABLE",
+                "message": "Couldn't confirm this payment's status right now — please try again shortly.",
+                "payment_id": payment.id,
+                "order_id": order_id,
+                "retryable": True,
+            },
+        )
+
     return service.finalize_paytm_payment(db, order_id, status_response)

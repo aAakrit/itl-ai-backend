@@ -25,7 +25,7 @@ from app.services import pricing_service, subscription_service
 from app.services import email_service
 from app.services.audit_service import log_action
 
-PAYMENT_STATUSES = {"pending", "success", "failed", "refunded"}
+PAYMENT_STATUSES = {"pending", "success", "failed", "gateway_error", "refunded"}
 PAYMENT_GATEWAYS = {"paytm", "cash", "complimentary"}
 
 
@@ -218,8 +218,40 @@ def record_gateway_init(db: Session, payment: Payment, txn_token: str, raw_respo
 
 
 def mark_init_failed(db: Session, payment: Payment, reason: str) -> Payment:
+    """Paytm's application layer explicitly rejected the request (bad
+    payload, invalid signature, business-rule rejection, etc). This is a
+    terminal state for the attempt — retrying the identical request is
+    expected to fail again the same way."""
     payment.status = "failed"
     payment.gateway_response = {**(payment.gateway_response or {}), "init_error": reason}
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def mark_init_gateway_error(
+    db: Session,
+    payment: Payment,
+    reason: str,
+    *,
+    status_code: Optional[int] = None,
+    body: Optional[str] = None,
+) -> Payment:
+    """Paytm's gateway was transiently unavailable (5xx/timeout/network
+    error) — the request was never confirmed accepted OR rejected. This is
+    deliberately NOT "failed": nothing about the payment itself is known
+    to be wrong, and a retry with the same order_id is safe (see
+    paytm_service._post_with_retry's docstring). Kept distinct from
+    "pending" too, so it's visible in the admin payments list which
+    attempts stalled on Paytm's side rather than a user simply not having
+    completed checkout yet."""
+    payment.status = "gateway_error"
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "init_error": reason,
+        "init_error_status_code": status_code,
+        "init_error_body": (body or "")[:2000] or None,
+    }
     db.commit()
     db.refresh(payment)
     return payment
