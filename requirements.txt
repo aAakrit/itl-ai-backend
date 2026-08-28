@@ -21,3 +21,4 @@ Pillow
 openpyxl
 python-docx
 reportlab
+paytmchecksum

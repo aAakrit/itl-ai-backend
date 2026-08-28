@@ -145,6 +145,24 @@ async def initiate_payment(
                 "retryable": False,
             },
         )
+    except paytm_service.PaytmConfigError as e:
+        # A malformed local config value (e.g. wrong-length merchant key)
+        # — never something Paytm said, never fixed by retrying, and NOT
+        # the same class of problem as a genuinely rejected transaction.
+        # Marked failed (not gateway_error) since a retry can't help until
+        # the underlying env var is corrected.
+        logger.error("Paytm config error for order %s: %s", payment.order_id, e)
+        service.mark_init_failed(db, payment, str(e))
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PAYMENT_CONFIG_ERROR",
+                "message": "Payment checkout is misconfigured. Please contact support.",
+                "payment_id": payment.id,
+                "order_id": payment.order_id,
+                "retryable": False,
+            },
+        )
     except Exception as e:
         # Anything unexpected (bug in our own code, etc) — don't guess at
         # what happened, but also don't leak internals to the frontend.

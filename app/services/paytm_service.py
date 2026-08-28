@@ -228,9 +228,32 @@ async def _post_with_retry(url: str, *, json_payload: dict, params: Optional[dic
 # Checksum primitives
 # =============================================================================
 
+class PaytmConfigError(Exception):
+    """Raised for a malformed local config value (e.g. wrong-length merchant
+    key) — never for anything Paytm's servers said. Distinguishing this
+    from PaytmRequestError matters: a bad key is fixable by us instantly,
+    not something to blame on Paytm or retry."""
+
+
 def _key_bytes(key: str) -> bytes:
-    # Paytm merchant keys are 16 bytes; normalize defensively just in case.
-    return key.encode("utf-8")[:16].ljust(16, b"0")
+    # AES-128 requires exactly 16 bytes. Silently truncating/padding a
+    # wrong-length key (the previous behavior here) produces a checksum
+    # that's syntactically valid but cryptographically WRONG — Paytm
+    # rejects it, and nothing about that failure points back at "your key
+    # is the wrong length" since the request otherwise looks fine. A
+    # single stray trailing newline/space from copy-pasting the key out of
+    # the Paytm dashboard (very common on Windows, where .env files often
+    # pick up a CRLF) is enough to trigger exactly that, silently. Stripped
+    # first since that specific mistake is safe to just fix; anything else
+    # wrong about the length fails loudly instead of guessing.
+    stripped = key.strip()
+    key_bytes = stripped.encode("utf-8")
+    if len(key_bytes) != 16:
+        raise PaytmConfigError(
+            f"PAYTM_MERCHANT_KEY must be exactly 16 bytes for AES-128 — got {len(key_bytes)}. "
+            "Re-copy it from the Paytm dashboard and check for a stray trailing space/newline."
+        )
+    return key_bytes
 
 
 def _aes_encrypt(plaintext: str, key: str) -> str:
@@ -338,7 +361,17 @@ async def initiate_transaction(
         },
     }
 
-    body_json = json.dumps(body, separators=(",", ":"))
+    # ensure_ascii=False + these exact separators must match httpx's own
+    # internal json encoding (httpx._content.encode_json) byte-for-byte —
+    # the checksum is computed over THIS string, but what's actually
+    # transmitted is re-serialized independently by httpx from the same
+    # `body` dict when passed via json=payload below. Any divergence
+    # (e.g. \uXXXX-escaped non-ASCII here vs raw UTF-8 on the wire) would
+    # sign a different string than what Paytm receives, without ever
+    # looking like an "obviously wrong" checksum. Currently a no-op for
+    # this specific body (mid/orderId/amount/custId are pure ASCII), but
+    # it's a correctness invariant, not a coincidence to leave unpinned.
+    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
     payload = {"body": body, "head": {"signature": checksum}}
 
@@ -381,7 +414,7 @@ async def verify_transaction_status(order_id: str) -> dict:
     so retrying is unambiguously safe."""
 
     body = {"mid": PAYTM_MID, "orderId": order_id}
-    body_json = json.dumps(body, separators=(",", ":"))
+    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
     payload = {"body": body, "head": {"signature": checksum}}
 

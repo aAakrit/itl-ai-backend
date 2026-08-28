@@ -52,7 +52,10 @@ async def main(amount: str):
     print(f"BASE_URL         = {paytm_service.BASE_URL}")
     print(f"PAYTM_MID        = {mask(PAYTM_MID)}")
     print(f"PAYTM_WEBSITE    = {PAYTM_WEBSITE!r}")
-    print(f"PAYTM_MERCHANT_KEY present? {'yes' if PAYTM_MERCHANT_KEY else 'NO — MISSING'} (never printed)")
+    key_len = len(PAYTM_MERCHANT_KEY.strip().encode("utf-8")) if PAYTM_MERCHANT_KEY else 0
+    key_len_flag = "OK" if key_len == 16 else "!!! MUST BE EXACTLY 16 — THIS WILL FAIL !!!"
+    print(f"PAYTM_MERCHANT_KEY present? {'yes' if PAYTM_MERCHANT_KEY else 'NO — MISSING'} (value never printed)")
+    print(f"PAYTM_MERCHANT_KEY length (after stripping whitespace): {key_len} bytes  [{key_len_flag}]")
     print(f"PAYTM_CALLBACK_URL = {PAYTM_CALLBACK_URL!r}")
     print()
 
@@ -73,6 +76,10 @@ async def main(amount: str):
             email="diagnostic@example.com",
             mobile="9999999999",
         )
+    except paytm_service.PaytmConfigError as e:
+        print("RESULT: PaytmConfigError — a LOCAL config problem, never reached Paytm")
+        print(f"  {e}")
+        return
     except paytm_service.PaytmGatewayError as e:
         print("RESULT: PaytmGatewayError (transient — gateway unreachable/erroring)")
         print(f"  status_code = {e.status_code}")
