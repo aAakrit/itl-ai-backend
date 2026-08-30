@@ -12,6 +12,7 @@ from app.models.user import User
 from app.routes.auth import require_admin
 from app.schemas.admin_user import UserUpdate
 from app.services import admin_user as service
+from app.services import admin_conversation_service
 from app.services import user_export_service
 
 router = APIRouter(
@@ -169,3 +170,24 @@ def get_user_history(
     db: Session = Depends(get_db),
 ):
     return service.get_user_history(db, user_id, page, limit)
+
+
+@router.get("/{user_id}/conversations")
+def get_user_conversations(
+    user_id: int,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return admin_conversation_service.list_user_conversations_for_admin(db, user_id, page=page, limit=limit)
+
+
+@router.get("/{user_id}/conversations/{conversation_id}")
+def get_user_conversation_detail(
+    user_id: int,
+    conversation_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    return admin_conversation_service.get_conversation_for_admin(db, conversation_id, user_id=user_id)

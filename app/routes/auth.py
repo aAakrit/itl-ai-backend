@@ -14,6 +14,7 @@ from app.models.password_reset_otp import PasswordResetOtp
 from app.schemas.user import UserLogin, UserRegister
 
 from app.services import email_service
+from app.services import notification_service
 from app.services.auth_utils import hash_password, verify_password
 from app.services.jwt import (
     SECRET_KEY,
@@ -75,6 +76,7 @@ def register(user: UserRegister, background_tasks: BackgroundTasks, db: Session 
     db.commit()
 
     background_tasks.add_task(email_service.send_registration_email, to=new_user.email, name=new_user.name)
+    notification_service.notify_user_pending_approval(db, new_user)
 
     return {
         "success": True,

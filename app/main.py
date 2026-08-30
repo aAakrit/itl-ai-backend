@@ -13,6 +13,7 @@ from app.models.payment import Payment
 from app.models.ai_usage import AIUsageLimit
 from app.models.audit_log import AuditLog
 from app.models.password_reset_otp import PasswordResetOtp
+from app.models.notification import Notification
 
 # Routes
 from app.routes.auth import router as auth_router
@@ -23,6 +24,8 @@ from app.routes.ai import router as ai_router
 from app.routes.subscription import router as admin_subscription_router
 from app.routes.payment import router as admin_payment_router
 from app.routes.payment import checkout_router as payment_checkout_router
+from app.routes.notification import router as admin_notification_router
+from app.routes.admin_logs import router as admin_logs_router
 from app.models.ai import (
     AIConversation,
     AIProviderSession,
@@ -90,3 +93,5 @@ app.include_router(ai_router)
 app.include_router(admin_subscription_router)
 app.include_router(admin_payment_router)
 app.include_router(payment_checkout_router)
+app.include_router(admin_notification_router)
+app.include_router(admin_logs_router)

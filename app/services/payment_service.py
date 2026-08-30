@@ -23,6 +23,7 @@ from app.models.user import User
 from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
 from app.services import pricing_service, subscription_service
 from app.services import email_service
+from app.services import notification_service
 from app.services.audit_service import log_action
 
 PAYMENT_STATUSES = {"pending", "success", "failed", "gateway_error", "refunded"}
@@ -155,6 +156,13 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
         plan_name=payment.plan_name,
         amount=str(payment.payable_amount),
         order_id=payment.order_id,
+    )
+    notification_service.notify_payment_completed(
+        db,
+        user_name=user.name,
+        plan_name=payment.plan_name,
+        amount=str(payment.payable_amount),
+        payment_id=payment.id,
     )
 
     return payment
@@ -366,6 +374,13 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
             plan_name=payment.plan_name,
             amount=str(payment.payable_amount),
             order_id=payment.order_id,
+        )
+        notification_service.notify_payment_completed(
+            db,
+            user_name=payment.customer_name or "A user",
+            plan_name=payment.plan_name,
+            amount=str(payment.payable_amount),
+            payment_id=payment.id,
         )
 
     return payment
