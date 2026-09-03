@@ -960,6 +960,34 @@ class ChatService:
 
         return True
 
+    def rename_conversation(self, user_id: int, conversation_id: int, title: str) -> Optional[AIConversation]:
+        """Renames a conversation. Returns None if it doesn't exist (or
+        doesn't belong to the requesting user)."""
+
+        conversation = self.get_conversation(user_id, conversation_id)
+        if not conversation:
+            return None
+
+        title = title.strip()
+        if title:
+            conversation.title = title[:255]
+            self.db.commit()
+            self.db.refresh(conversation)
+        return conversation
+
+    def set_archived(self, user_id: int, conversation_id: int, archived: bool) -> Optional[AIConversation]:
+        """Archives/unarchives a conversation. Returns None if it doesn't
+        exist (or doesn't belong to the requesting user)."""
+
+        conversation = self.get_conversation(user_id, conversation_id)
+        if not conversation:
+            return None
+
+        conversation.is_archived = archived
+        self.db.commit()
+        self.db.refresh(conversation)
+        return conversation
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------

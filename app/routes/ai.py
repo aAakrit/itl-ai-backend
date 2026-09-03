@@ -8,6 +8,8 @@ import os
 import time
 from datetime import datetime
 
+from pydantic import BaseModel, Field
+
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
 from app.services.chat import ChatService, NoticeStageError, NoticeUnavailableError
@@ -293,6 +295,58 @@ async def delete_conversation(
     return success_response(
         data={"id": conversation_id},
         message="Conversation deleted successfully.",
+    )
+
+
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=255)
+
+
+@router.patch(
+    "/conversations/{conversation_id}/rename",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Rename Conversation",
+)
+async def rename_conversation(
+    conversation_id: int,
+    payload: ConversationRenameRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    conversation = chat.rename_conversation(current_user.id, conversation_id, payload.title)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return success_response(
+        data=chat.serialize_conversation(conversation),
+        message="Conversation renamed successfully.",
+    )
+
+
+class ConversationArchiveRequest(BaseModel):
+    archived: bool = True
+
+
+@router.patch(
+    "/conversations/{conversation_id}/archive",
+    response_model=AIResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Archive/Unarchive Conversation",
+)
+async def archive_conversation(
+    conversation_id: int,
+    payload: ConversationArchiveRequest,
+    chat: ChatService = Depends(get_chat_service),
+    current_user: User = Depends(get_current_user),
+):
+    conversation = chat.set_archived(current_user.id, conversation_id, payload.archived)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+
+    return success_response(
+        data=chat.serialize_conversation(conversation),
+        message="Conversation updated successfully.",
     )
 
 
