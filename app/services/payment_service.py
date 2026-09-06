@@ -30,6 +30,14 @@ PAYMENT_STATUSES = {"pending", "success", "failed", "gateway_error", "refunded"}
 PAYMENT_GATEWAYS = {"paytm", "cash", "complimentary"}
 
 
+def _billing_address(user: User) -> Optional[str]:
+    """Snapshot the user's address as a single line at payment time — the
+    invoice needs it even if the user edits their profile afterward."""
+    parts = [user.address, user.city, user.state, user.pin_code]
+    joined = ", ".join(str(p) for p in parts if p)
+    return joined or None
+
+
 def get(db: Session, payment_id: int) -> Payment:
     payment = db.query(Payment).filter(Payment.id == payment_id).first()
     if not payment:
@@ -122,6 +130,8 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
         customer_name=user.name,
         customer_email=user.email,
         customer_mobile=user.mobile,
+        customer_gstin=user.gstin,
+        customer_address=_billing_address(user),
         recorded_by_admin_id=admin_id,
         payment_notes=payload.payment_notes,
         paid_at=datetime.utcnow(),
@@ -206,6 +216,8 @@ def create_paytm_payment(db: Session, user: User, plan_id: str, billing_cycle: s
         customer_name=user.name,
         customer_email=user.email,
         customer_mobile=user.mobile,
+        customer_gstin=user.gstin,
+        customer_address=_billing_address(user),
         gateway_response={"billing_cycle": billing_cycle},
     )
     db.add(payment)

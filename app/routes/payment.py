@@ -1,10 +1,11 @@
+import io
 import json
 import logging
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.config import FRONTEND_URL
@@ -12,6 +13,7 @@ from app.db import SessionLocal
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
 from app.schemas.subscription import CashPaymentCreate, PaymentInitiateRequest, PaymentInitiateResponse, PaymentResponse
+from app.services import invoice_service
 from app.services import payment_service as service
 from app.services import paytm_service
 
@@ -82,6 +84,35 @@ def record_cash_payment(
     db: Session = Depends(get_db),
 ):
     return service.record_cash_payment(db, admin.id, payload)
+
+
+@router.get("/{payment_id}/receipt")
+def get_payment_receipt(
+    payment_id: int,
+    format: str = Query("pdf", description="pdf | docx"),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Generates an invoice/receipt for a successful payment — works
+    identically whether it was a manual/cash entry or a completed Paytm
+    payment, since both produce the same Payment snapshot fields this
+    reads from. Only makes sense for a successful payment; anything else
+    has nothing to receipt."""
+
+    payment = service.get(db, payment_id)
+    if payment.status != "success":
+        raise HTTPException(status_code=400, detail="Only successful payments have a receipt.")
+
+    if format not in ("pdf", "docx"):
+        raise HTTPException(status_code=400, detail="format must be pdf or docx")
+
+    file_bytes, content_type, filename = invoice_service.build_receipt(payment, format)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # =============================================================================
