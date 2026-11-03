@@ -83,6 +83,7 @@ def get_users(
     approval_status: Optional[str] = None,
     state: Optional[str] = None,
     city: Optional[str] = None,
+    product: Optional[str] = Query(None, description="itl_ai | itl_bridge_ai"),
     sort: str = Query("created_at"),
     order: str = Query("desc"),
     admin: User = Depends(require_admin),
@@ -107,6 +108,7 @@ def get_users(
         approval_status=approval_status,
         state=state,
         city=city,
+        product=product,
         sort=sort,
         order=order,
     )

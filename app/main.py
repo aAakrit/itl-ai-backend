@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -26,6 +28,8 @@ from app.routes.payment import router as admin_payment_router
 from app.routes.payment import checkout_router as payment_checkout_router
 from app.routes.notification import router as admin_notification_router
 from app.routes.admin_logs import router as admin_logs_router
+from app.routes.bridge import router as bridge_router, admin_router as admin_bridge_router
+from app.services import bridge_service
 from app.models.ai import (
     AIConversation,
     AIProviderSession,
@@ -39,6 +43,12 @@ from app.core.exception_handlers import register_exception_handlers
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
+
+# create_all only creates missing tables — add the newer users column to an
+# existing database too (idempotent; PostgreSQL).
+with engine.begin() as _conn:
+    _conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_source VARCHAR(30)")
+    _conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_users_signup_source ON users (signup_source)")
 
 app = FastAPI(
     title="ITL AI Backend",
@@ -95,3 +105,13 @@ app.include_router(admin_payment_router)
 app.include_router(payment_checkout_router)
 app.include_router(admin_notification_router)
 app.include_router(admin_logs_router)
+app.include_router(bridge_router)
+app.include_router(admin_bridge_router)
+
+
+@app.on_event("startup")
+async def start_bridge_resync():
+    # Nightly safety net for ITL Bridge AI: re-sends every active
+    # subscription (idempotent), repairing anything a payment hook missed.
+    if bridge_service.is_configured():
+        asyncio.create_task(bridge_service.nightly_resync_loop())

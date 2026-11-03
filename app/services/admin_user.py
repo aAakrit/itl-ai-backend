@@ -11,6 +11,7 @@ from app.models.payment import Payment
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.admin_user import UserUpdate
+from app.services import bridge_service
 from app.services.audit_service import log_action
 from app.services.auth_utils import hash_password
 
@@ -193,6 +194,15 @@ def _ai_summary(usage: Optional[AIUsageLimit]) -> dict:
     }
 
 
+def _product(user: User, subscription) -> str:
+    """'itl_bridge_ai' if the account signed up on the Bridge pages or holds a Bridge plan."""
+    if getattr(user, "signup_source", None) == "itl_bridge_ai":
+        return "itl_bridge_ai"
+    if subscription is not None and subscription.plan_id in bridge_service.bridge_plan_ids():
+        return "itl_bridge_ai"
+    return "itl_ai"
+
+
 def _build_user_row(user: User, subscription, payment, ai_usage) -> dict:
     return {
         "id": user.id,
@@ -211,6 +221,7 @@ def _build_user_row(user: User, subscription, payment, ai_usage) -> dict:
         "status": user.status,
         "last_login": getattr(user, "last_login", None),
         "created_at": user.created_at,
+        "product": _product(user, subscription),
         "subscription": _subscription_summary(subscription),
         "payment": _payment_summary(payment),
         "ai_usage": _ai_summary(ai_usage),
@@ -289,6 +300,7 @@ def get_users(
     approval_status: Optional[str] = None,
     state: Optional[str] = None,
     city: Optional[str] = None,
+    product: Optional[str] = None,
 ):
     """Return the existing admin user list enriched with current entitlement data.
 
@@ -421,6 +433,16 @@ def get_users(
         query = query.filter(User.state.ilike(f"%{state}%"))
     if city:
         query = query.filter(User.city.ilike(f"%{city}%"))
+
+    if product:
+        product = product.lower()
+        if product not in ("itl_ai", "itl_bridge_ai"):
+            raise HTTPException(400, "Invalid product. Expected one of: itl_ai, itl_bridge_ai")
+        in_bridge = or_(
+            func.coalesce(User.signup_source, "") == "itl_bridge_ai",
+            func.coalesce(CurrentSubscription.plan_id, "").in_(bridge_service.bridge_plan_ids()),
+        )
+        query = query.filter(in_bridge if product == "itl_bridge_ai" else ~in_bridge)
 
     sortable = {
         "name": User.name,

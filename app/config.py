@@ -41,3 +41,17 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
 EMAIL_FROM = os.getenv("EMAIL_FROM", "info.incometaxlibrary@gmail.com")
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Income Tax Library")
+
+
+# ITL Bridge AI (MCP server) — see app/services/bridge_service.py
+BRIDGE_API_URL = os.getenv("BRIDGE_API_URL", "https://mcp.incometaxlibrary.com/bridge/api").rstrip("/")
+BRIDGE_ADMIN_KEY = os.getenv("BRIDGE_ADMIN_KEY", "")
+BRIDGE_HANDOFF_SECRET = os.getenv("BRIDGE_HANDOFF_SECRET", "")
+# Bridge user ids must be unique across both ITL websites: "com:<id>" for
+# incometaxlibrary.com users, "in:<id>" for incometaxlibrary.in users.
+BRIDGE_USER_PREFIX = os.getenv("BRIDGE_USER_PREFIX", "in")
+# JSON object mapping this app's pricing plan -> Bridge plan code, e.g.
+# {"pro:yearly": "bridge_yearly", "enterprise": "bundle_yearly"}. Keys are
+# "<plan_id>:<billing_cycle>" (checked first) or just "<plan_id>". A plan
+# that is not mapped (and is not itself a Bridge plan code) is not synced.
+BRIDGE_PLAN_MAP = os.getenv("BRIDGE_PLAN_MAP", "{}")

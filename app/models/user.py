@@ -47,4 +47,9 @@ class User(Base):
 
     last_login = Column(DateTime, nullable=True)
 
+    # Which product page the account was created from: "itl_ai" (default,
+    # also NULL for older rows) or "itl_bridge_ai". Used for the admin
+    # ITL AI / ITL Bridge AI filter — accounts are shared between products.
+    signup_source = Column(String(30), nullable=True, index=True)
+
     deleted_at = Column(DateTime, nullable=True)

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models.subscription import Subscription
 from app.models.user import User
-from app.services import pricing_service
+from app.services import bridge_service, pricing_service
 from app.services.audit_service import log_action
 
 CYCLE_DAYS = {"monthly": 30, "yearly": 365}
@@ -104,6 +104,7 @@ def create_manual(db: Session, admin_id: int, payload) -> Subscription:
 
     db.commit()
     db.refresh(sub)
+    bridge_service.sync_subscription(db, sub)
     return sub
 
 
@@ -147,6 +148,7 @@ def update(db: Session, admin_id: int, subscription_id: int, payload) -> Subscri
 
     db.commit()
     db.refresh(sub)
+    bridge_service.sync_subscription(db, sub)
     return sub
 
 
@@ -174,6 +176,7 @@ def extend(db: Session, admin_id: int, subscription_id: int, days: int, reason: 
 
     db.commit()
     db.refresh(sub)
+    bridge_service.sync_subscription(db, sub)
     return sub
 
 
@@ -198,6 +201,7 @@ def set_status(db: Session, admin_id: int, subscription_id: int, status: str, re
 
     db.commit()
     db.refresh(sub)
+    bridge_service.sync_subscription(db, sub)
     return sub
 
 
@@ -213,6 +217,7 @@ def list_subscriptions(
     expiry_window: Optional[str] = None,  # expired | today | 7d | 30d | 60d | 90d
     expiry_from: Optional[datetime] = None,
     expiry_to: Optional[datetime] = None,
+    product: Optional[str] = None,  # itl_ai | itl_bridge_ai
 ) -> dict:
     query = db.query(Subscription).join(User, Subscription.user_id == User.id)
 
@@ -222,6 +227,12 @@ def list_subscriptions(
         query = query.filter(Subscription.plan_id == plan_id)
     if source:
         query = query.filter(Subscription.source == source)
+    if product:
+        bridge_ids = bridge_service.bridge_plan_ids()
+        if product == "itl_bridge_ai":
+            query = query.filter(Subscription.plan_id.in_(bridge_ids))
+        elif product == "itl_ai":
+            query = query.filter(~Subscription.plan_id.in_(bridge_ids))
     if search:
         query = query.filter(or_(User.name.ilike(f"%{search}%"), User.email.ilike(f"%{search}%")))
 

@@ -70,6 +70,7 @@ def register(user: UserRegister, background_tasks: BackgroundTasks, db: Session 
         pin_code=user.pin_code,
 
         status="PENDING",
+        signup_source="itl_bridge_ai" if user.product == "bridge" else "itl_ai",
     )
 
     db.add(new_user)

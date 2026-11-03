@@ -20,6 +20,9 @@ class UserRegister(BaseModel):
     state: str
     pin_code: str
 
+    # "bridge" when registering from the ITL Bridge AI pages
+    product: str | None = None
+
 
 class UserLogin(BaseModel):
     email: EmailStr

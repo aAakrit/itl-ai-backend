@@ -1,421 +1,400 @@
 """
-Paytm integration.
+Payment service — admin listing, manual/cash payment recording, and the
+Paytm online checkout flow (initiate -> gateway -> callback -> finalize).
 
-Credentials come from environment variables only (see app/config.py
-additions) — never hardcoded, never committed.
-
-SECURITY: the callback (`/payments/paytm/callback`) is NEVER trusted on
-its own. Every callback triggers an explicit server-to-server call to
-Paytm's Transaction Status API before a subscription is activated — a
-forged or replayed callback cannot activate anything by itself.
-
-CHECKSUM ALGORITHM
--------------------
-Paytm's checksum is NOT a plain HMAC. It's:
-
-    salt        = 4 random alphanumeric characters
-    hashInput   = "<data>|<salt>"
-    hashHex     = sha256(hashInput).hexdigest()
-    signature   = AES-128-CBC(PKCS7, IV="@@@@&&&&####$$$$") of (hashHex + salt),
-                  base64-encoded, using the merchant key as the AES key
-
-Verifying means decrypting the checksum to recover the salt Paytm used —
-you cannot "regenerate and compare" like an HMAC, because every fresh
-checksum embeds a *new* random salt and will never equal an old one.
-
-Two different `<data>` shapes are used depending on the API generation:
-  * JSON-body APIs (initiateTransaction, order/status): `<data>` is the
-    exact JSON string of the request body — Paytm's own Node SDK calls
-    this `generateSignature(JSON.stringify(body), key)`.
-  * The classic flat-form callback Paytm POSTs to callbackUrl: `<data>`
-    is every field except CHECKSUMHASH, sorted by key, values pipe-joined
-    (nulls skipped) — the `generateSignature(paramsDict, key)` variant.
-
-Implemented directly (via `cryptography`) rather than the unmaintained
-`paytmchecksum` PyPI package, which has had no recent release and
-depends on the abandoned `pycrypto`.
+Cash payments reuse subscription_service.create_manual so both flows
+produce identical, consistent subscription records. Paytm payments use
+their own activation path (_activate_subscription_for_payment) since they
+go through finalize_paytm_payment rather than the admin-only
+SubscriptionCreateManual schema — see that function's docstring.
 """
 
-import asyncio
-import base64
-import hashlib
-import hmac
-import json
-import logging
-import random
-import string
-from typing import Any, Optional
+import uuid
+from datetime import datetime, timedelta
+from typing import Optional
 
-import httpx
+from fastapi import HTTPException
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
 
-from app.config import (
-    PAYTM_MID,
-    PAYTM_MERCHANT_KEY,
-    PAYTM_WEBSITE,
-    PAYTM_CALLBACK_URL,
-    PAYTM_ENV,
-)
+from app.models.payment import Payment
+from app.models.subscription import Subscription
+from app.models.user import User
+from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
+from app.services import bridge_service, pricing_service, subscription_service
+from app.services import email_service
+from app.services import notification_service
+from app.services.audit_service import log_action
 
-logger = logging.getLogger(__name__)
-
-# Paytm's own staging/production API + JS Checkout hosts. Confirmed against
-# current docs (paytmpayments.com/docs/jscheckout-initiate-payment) —
-# NOT securegw(-stage).paytm.in, which is the legacy "Standard Checkout"
-# host and is documented as deprecated. Using the old host is what produced
-# the 503s: requests either never reached the current application layer or
-# hit a sunset/redirecting edge.
-BASE_URL = "https://secure.paytmpayments.com" if PAYTM_ENV == "production" else "https://securestage.paytmpayments.com"
-
-# Paytm's fixed IV for the checksum's AES-128-CBC step — published in every
-# one of their SDKs, not a secret.
-_IV = b"@@@@&&&&####$$$$"
-
-# initiateTransaction resultCode -> human meaning, straight from Paytm's
-# own docs (paytmpayments.com/docs/jscheckout-initiate-payment). resultMsg
-# alone is too generic to act on ("System Error" covers a whole bucket of
-# causes) — pairing the numeric code with what it actually means turns the
-# next failure into an immediate diagnosis instead of another guess-and-log
-# round trip.
-RESULT_CODE_MEANINGS = {
-    "0000": "Success",
-    "0002": "Success (idempotent — already processed)",
-    "196": "Amount exceeds the allowed limit",
-    "1001": "Request parameters are not valid",
-    "1006": "Session has expired",
-    "1007": "Missing mandatory element — a required field is absent from the request body",
-    "1008": "Pipe character is not allowed in a field value",
-    "1009": "Promo code request is not valid",
-    "1011": "Invalid promo param",
-    "1012": "Promo amount exceeds transaction amount",
-    "2004": "SSO token is invalid",
-    "2005": "Checksum provided is invalid — signature/key mismatch",
-    "2007": "Transaction amount is invalid",
-    "2013": "MID in the query param doesn't match the mid in the request body",
-    "2014": "orderId in the query param doesn't match the orderId in the request body",
-    "2023": "Repeat request is inconsistent with the original",
-    "2100": "Link details are not valid",
-    "00000900": "System error — Paytm's generic internal failure bucket; often a merchant-account/provisioning issue (MID not enabled for this API, key/environment mismatch, websiteName not recognized for this MID) rather than a request-formatting bug",
-    # 501 is NOT documented for initiateTransaction in Paytm's own current
-    # docs (paytmpayments.com/docs/api/initiate-transaction-api) — the
-    # code exists elsewhere in Paytm's ecosystem with DIFFERENT meanings
-    # per API (e.g. "bank declined" in a post-payment transaction-status
-    # context, generic "System Error" in a refund-status context), neither
-    # of which is safe to assume applies here. Recorded as observed, not
-    # as a confirmed meaning — see paytm_service module docs/tests for the
-    # investigation that ruled out request construction and checksum as
-    # the cause before landing here.
-    "501": "Undocumented for initiateTransaction specifically — observed in staging as a generic \"System Error\"; not confirmed to mean checksum, amount, or parameter issues (those have their own distinct codes). Most consistent with a merchant-account/provisioning-side cause.",
-}
+PAYMENT_STATUSES = {"pending", "success", "failed", "gateway_error", "refunded"}
+PAYMENT_GATEWAYS = {"paytm", "cash", "complimentary"}
 
 
-def describe_result_code(result_code: Optional[str]) -> str:
-    if not result_code:
-        return "unknown"
-    return RESULT_CODE_MEANINGS.get(str(result_code), "undocumented result code")
-
-# HTTP statuses treated as transient/infra-level and safe to retry — a
-# narrow set on purpose. 500 is deliberately excluded: in practice a Paytm
-# 500 is far more often an application-level rejection of the payload than
-# a transient blip, so it's surfaced as a (non-retried) gateway error
-# rather than silently retried.
-_RETRYABLE_STATUSES = {502, 503, 504}
-_MAX_ATTEMPTS = 3
-_BACKOFF_SECONDS = (0.5, 1.5)  # delay before attempt 2, before attempt 3
+def _billing_address(user: User) -> Optional[str]:
+    """Snapshot the user's address as a single line at payment time — the
+    invoice needs it even if the user edits their profile afterward."""
+    parts = [user.address, user.city, user.state, user.pin_code]
+    joined = ", ".join(str(p) for p in parts if p)
+    return joined or None
 
 
-class PaytmError(Exception):
-    """Base for anything that goes wrong talking to Paytm. Carries the raw
-    status/body (when available) so callers can log or inspect it without
-    parsing exception strings."""
-
-    def __init__(self, message: str, *, status_code: Optional[int] = None, body: Optional[str] = None):
-        super().__init__(message)
-        self.status_code = status_code
-        self.body = body
+def get(db: Session, payment_id: int) -> Payment:
+    payment = db.query(Payment).filter(Payment.id == payment_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    return payment
 
 
-class PaytmGatewayError(PaytmError):
-    """Transient — Paytm's gateway itself was unavailable (5xx we retried
-    and still failed, a timeout, or a connection error). The request was
-    never confirmed accepted OR rejected by Paytm. Safe to retry later
-    with a fresh call; the caller should NOT treat this as a declined
-    payment."""
-
-
-class PaytmRequestError(PaytmError):
-    """Non-transient — Paytm's application layer responded and explicitly
-    rejected the request (4xx, or a 5xx outside the retryable set). Retrying
-    the identical request is expected to fail the same way again."""
-
-
-def _safe_body_preview(response: httpx.Response, limit: int = 2000) -> str:
-    """Best-effort text of a response body for logging. Paytm's error
-    bodies describe Paytm-side problems (bad mid, bad signature, etc.) —
-    they do not echo back the merchant key or other secrets we sent, so
-    this is safe to log. Truncated defensively regardless."""
-    try:
-        text = response.text
-    except Exception:
-        return "<unreadable body>"
-    return text[:limit]
-
-
-async def _post_with_retry(url: str, *, json_payload: dict, params: Optional[dict] = None) -> dict:
-    """POSTs to a Paytm endpoint, retrying a narrow set of transient
-    failures with exponential backoff, and returns the parsed JSON body on
-    success.
-
-    Retrying is safe here specifically because every call site passes the
-    *same* orderId on every attempt (generated once, before this is ever
-    called) and Paytm's initiateTransaction / order-status APIs are
-    idempotent per orderId at this stage — no money moves and no duplicate
-    order is created by calling them again with an orderId that hasn't
-    produced a completed transaction yet.
-    """
-
-    last_error: Optional[PaytmError] = None
-
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, params=params, json=json_payload)
-        except (httpx.TimeoutException, httpx.TransportError) as e:
-            last_error = PaytmGatewayError(f"Network error calling Paytm: {e}")
-            logger.warning("Paytm request network error (attempt %s/%s): %s — %s", attempt, _MAX_ATTEMPTS, url, e)
-        else:
-            if response.status_code < 400:
-                try:
-                    return response.json()
-                except ValueError:
-                    # 2xx with an unparseable body — Paytm's application
-                    # layer responded but not with anything we can use.
-                    # Not something a retry fixes.
-                    body = _safe_body_preview(response)
-                    logger.error("Paytm returned %s with a malformed body — %s: %s", response.status_code, url, body)
-                    raise PaytmGatewayError(
-                        "Paytm returned an unreadable response.",
-                        status_code=response.status_code,
-                        body=body,
-                    )
-
-            body = _safe_body_preview(response)
-            logger.warning("Paytm HTTP status: %s | url: %s | response body: %s", response.status_code, url, body)
-
-            if response.status_code in _RETRYABLE_STATUSES:
-                last_error = PaytmGatewayError(
-                    f"Paytm gateway returned {response.status_code}.",
-                    status_code=response.status_code,
-                    body=body,
-                )
-            else:
-                # A definitive answer from Paytm's application layer —
-                # retrying the same payload will not change it.
-                raise PaytmRequestError(
-                    f"Paytm rejected the request ({response.status_code}).",
-                    status_code=response.status_code,
-                    body=body,
-                )
-
-        if attempt < _MAX_ATTEMPTS:
-            await asyncio.sleep(_BACKOFF_SECONDS[attempt - 1])
-
-    # Retries exhausted — still only a transient/gateway problem, never
-    # escalated to "rejected".
-    raise last_error or PaytmGatewayError("Paytm gateway unavailable after retries.")
-
-
-# =============================================================================
-# Checksum primitives
-# =============================================================================
-
-class PaytmConfigError(Exception):
-    """Raised for a malformed local config value (e.g. wrong-length merchant
-    key) — never for anything Paytm's servers said. Distinguishing this
-    from PaytmRequestError matters: a bad key is fixable by us instantly,
-    not something to blame on Paytm or retry."""
-
-
-def _key_bytes(key: str) -> bytes:
-    # AES-128 requires exactly 16 bytes. Silently truncating/padding a
-    # wrong-length key (the previous behavior here) produces a checksum
-    # that's syntactically valid but cryptographically WRONG — Paytm
-    # rejects it, and nothing about that failure points back at "your key
-    # is the wrong length" since the request otherwise looks fine. A
-    # single stray trailing newline/space from copy-pasting the key out of
-    # the Paytm dashboard (very common on Windows, where .env files often
-    # pick up a CRLF) is enough to trigger exactly that, silently. Stripped
-    # first since that specific mistake is safe to just fix; anything else
-    # wrong about the length fails loudly instead of guessing.
-    stripped = key.strip()
-    key_bytes = stripped.encode("utf-8")
-    if len(key_bytes) != 16:
-        raise PaytmConfigError(
-            f"PAYTM_MERCHANT_KEY must be exactly 16 bytes for AES-128 — got {len(key_bytes)}. "
-            "Re-copy it from the Paytm dashboard and check for a stray trailing space/newline."
-        )
-    return key_bytes
-
-
-def _aes_encrypt(plaintext: str, key: str) -> str:
-    from cryptography.hazmat.primitives import padding
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-    padder = padding.PKCS7(algorithms.AES.block_size).padder()
-    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
-    cipher = Cipher(algorithms.AES(_key_bytes(key)), modes.CBC(_IV))
-    encryptor = cipher.encryptor()
-    encrypted = encryptor.update(padded) + encryptor.finalize()
-    return base64.b64encode(encrypted).decode("utf-8")
-
-
-def _aes_decrypt(ciphertext_b64: str, key: str) -> str:
-    from cryptography.hazmat.primitives import padding
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-    encrypted = base64.b64decode(ciphertext_b64)
-    cipher = Cipher(algorithms.AES(_key_bytes(key)), modes.CBC(_IV))
-    decryptor = cipher.decryptor()
-    padded = decryptor.update(encrypted) + decryptor.finalize()
-    unpadder = padding.PKCS7(algorithms.AES.block_size).unpadder()
-    return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
-
-
-def _random_salt(length: int = 4) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(random.SystemRandom().choice(alphabet) for _ in range(length))
-
-
-def _generate_signature_by_string(data: str, key: str) -> str:
-    """For JSON-body APIs — Paytm's SDKs call this generateSignature(JSON.stringify(body), key)."""
-    salt = _random_salt()
-    hash_hex = hashlib.sha256(f"{data}|{salt}".encode("utf-8")).hexdigest()
-    return _aes_encrypt(hash_hex + salt, key)
-
-
-def _params_to_string(params: dict[str, Any]) -> str:
-    """Sorted-by-key, pipe-joined VALUES — the classic flat-form checksum
-    input, used for the callback Paytm posts to callbackUrl.
-
-    Matches Paytm's own reference getStringByParams exactly: a null/missing
-    value becomes an empty string IN PLACE, not a skipped entry. Skipping
-    would shift every value after it by one position in the pipe-joined
-    string, producing a completely different (and wrong) string the moment
-    any field is null — which silently breaks verification for any
-    callback that happens to have one."""
-    ordered = dict(sorted(params.items()))
-    return "|".join(
-        "" if v is None or str(v).lower() == "null" else str(v)
-        for v in ordered.values()
-    )
-
-
-def _verify_signature_by_params(params: dict[str, Any], key: str, checksum: str) -> bool:
-    """Decrypts the checksum to recover the salt Paytm used, recomputes the
-    hash with that salt, and compares. A freshly generated checksum can
-    never be compared directly — see module docstring."""
-    try:
-        decrypted = _aes_decrypt(checksum, key)
-    except Exception:
-        return False
-    if len(decrypted) < 4:
-        return False
-    salt, expected_hash = decrypted[-4:], decrypted[:-4]
-    data = _params_to_string(params)
-    actual_hash = hashlib.sha256(f"{data}|{salt}".encode("utf-8")).hexdigest()
-    return hmac.compare_digest(actual_hash, expected_hash)
-
-
-# =============================================================================
-# Initiate Transaction
-# =============================================================================
-
-async def initiate_transaction(
+def list_payments(
+    db: Session,
     *,
-    order_id: str,
-    amount: str,
-    customer_id: str,
-    email: Optional[str] = None,
-    mobile: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+    status: Optional[str] = None,
+    gateway: Optional[str] = None,
+    search: Optional[str] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
 ) -> dict:
-    """
-    POST /theia/api/v1/initiateTransaction — returns Paytm's txnToken,
-    which the frontend uses to open Paytm's checkout for this order.
+    query = db.query(Payment)
 
-    Raises PaytmGatewayError for transient failures (retried internally
-    first) or PaytmRequestError if Paytm's application layer explicitly
-    rejected the request — see _post_with_retry's docstring for why
-    retrying with this same order_id is safe.
-    """
+    if status:
+        status = status.lower()
+        if status not in PAYMENT_STATUSES:
+            raise HTTPException(400, f"Invalid status. Expected one of: {', '.join(sorted(PAYMENT_STATUSES))}")
+        query = query.filter(Payment.status == status)
 
-    body = {
-        "requestType": "Payment",
-        "mid": PAYTM_MID,
-        "websiteName": PAYTM_WEBSITE,
-        "orderId": order_id,
-        "callbackUrl": PAYTM_CALLBACK_URL,
-        "txnAmount": {"value": amount, "currency": "INR"},
-        "userInfo": {
-            "custId": customer_id,
-            **({"email": email} if email else {}),
-            **({"mobile": mobile} if mobile else {}),
+    if gateway:
+        gateway = gateway.lower()
+        if gateway not in PAYMENT_GATEWAYS:
+            raise HTTPException(400, f"Invalid gateway. Expected one of: {', '.join(sorted(PAYMENT_GATEWAYS))}")
+        query = query.filter(Payment.gateway == gateway)
+
+    if search:
+        term = f"%{search}%"
+        query = query.filter(
+            or_(
+                Payment.customer_name.ilike(term),
+                Payment.customer_email.ilike(term),
+                Payment.order_id.ilike(term),
+                Payment.invoice_number.ilike(term),
+                Payment.receipt_number.ilike(term),
+            )
+        )
+
+    if date_from:
+        query = query.filter(Payment.created_at >= date_from)
+    if date_to:
+        query = query.filter(Payment.created_at <= date_to)
+
+    total = query.count()
+    items = (
+        query.order_by(Payment.created_at.desc(), Payment.id.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .all()
+    )
+    return {"items": items, "total": total, "page": page, "limit": limit}
+
+
+def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) -> Payment:
+    """Records an offline/cash payment and activates the subscription it pays for."""
+
+    user = db.query(User).filter(User.id == payload.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    sub_payload = SubscriptionCreateManual(
+        user_id=payload.user_id,
+        plan_id=payload.plan_id,
+        billing_cycle=payload.billing_cycle,
+        source="manual",
+        override_base_price=payload.override_base_price,
+        notes=payload.payment_notes,
+    )
+    subscription = subscription_service.create_manual(db, admin_id, sub_payload)
+
+    payment = Payment(
+        user_id=payload.user_id,
+        subscription_id=subscription.id,
+        gateway="cash",
+        status="success",
+        order_id=f"CASH-{uuid.uuid4().hex[:16].upper()}",
+        plan_id=subscription.plan_id,
+        plan_name=subscription.plan_name,
+        base_price=subscription.base_price,
+        gst_rate=subscription.gst_rate,
+        gst_amount=subscription.gst_amount,
+        payable_amount=subscription.payable_amount,
+        currency="INR",
+        customer_name=user.name,
+        customer_email=user.email,
+        customer_mobile=user.mobile,
+        customer_gstin=user.gstin,
+        customer_address=_billing_address(user),
+        recorded_by_admin_id=admin_id,
+        payment_notes=payload.payment_notes,
+        paid_at=datetime.utcnow(),
+    )
+    db.add(payment)
+    db.flush()
+
+    # Allocated after flush so the payment's own id can be embedded.
+    payment.invoice_number = f"INV-CASH-{payment.id:06d}"
+    payment.receipt_number = f"RCPT-CASH-{payment.id:06d}"
+
+    log_action(
+        db,
+        actor_id=admin_id,
+        action="payment.recorded_cash",
+        target_type="payment",
+        target_id=payment.id,
+        new_value={
+            "subscription_id": subscription.id,
+            "amount": str(payment.payable_amount),
+            "plan_id": payment.plan_id,
         },
-    }
-
-    # ensure_ascii=False + these exact separators must match httpx's own
-    # internal json encoding (httpx._content.encode_json) byte-for-byte —
-    # the checksum is computed over THIS string, but what's actually
-    # transmitted is re-serialized independently by httpx from the same
-    # `body` dict when passed via json=payload below. Any divergence
-    # (e.g. \uXXXX-escaped non-ASCII here vs raw UTF-8 on the wire) would
-    # sign a different string than what Paytm receives, without ever
-    # looking like an "obviously wrong" checksum. Currently a no-op for
-    # this specific body (mid/orderId/amount/custId are pure ASCII), but
-    # it's a correctness invariant, not a coincidence to leave unpinned.
-    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
-    payload = {"body": body, "head": {"signature": checksum}}
-
-    return await _post_with_retry(
-        f"{BASE_URL}/theia/api/v1/initiateTransaction",
-        json_payload=payload,
-        params={"mid": PAYTM_MID, "orderId": order_id},
+        reason=payload.payment_notes,
     )
 
+    db.commit()
+    db.refresh(payment)
 
-def checkout_script_url() -> str:
-    """The JS Checkout SDK script — current recommended integration
-    (paytmpayments.com/docs/jscheckout-invoke-payment). Renders an iframe
-    on the merchant's own page rather than redirecting to a Paytm-hosted
-    page; the deprecated `showPaymentPage` full-page redirect this used to
-    point at is no longer the recommended flow."""
-    return f"{BASE_URL}/merchantpgpui/checkoutjs/merchants/{PAYTM_MID}.js"
+    email_service.send_payment_receipt_email(
+        to=user.email,
+        name=user.name,
+        plan_name=payment.plan_name,
+        amount=str(payment.payable_amount),
+        order_id=payment.order_id,
+    )
+    notification_service.notify_payment_completed(
+        db,
+        user_name=user.name,
+        plan_name=payment.plan_name,
+        amount=str(payment.payable_amount),
+        payment_id=payment.id,
+    )
+
+    return payment
 
 
 # =============================================================================
-# Callback verification
+# Paytm checkout flow
+#
+# Payment.gateway_response is used to stash a small amount of internal
+# bookkeeping (billing_cycle, the txnToken, raw gateway payloads) between
+# initiate and finalize — merged (never overwritten wholesale) on every
+# update so nothing added earlier is lost. This avoids a schema migration
+# for a single extra field, at the cost of that data living in a JSON blob
+# instead of a column; fine for what it's used for (debugging + one lookup
+# at finalize time), not something queried on.
 # =============================================================================
 
-def verify_callback_checksum(callback_params: dict[str, Any]) -> bool:
-    params = {k: v for k, v in callback_params.items() if k != "CHECKSUMHASH"}
-    checksum = callback_params.get("CHECKSUMHASH", "")
-    if not checksum:
-        return False
-    return _verify_signature_by_params(params, PAYTM_MERCHANT_KEY, checksum)
+def _new_order_id() -> str:
+    return f"ITL-{uuid.uuid4().hex[:20].upper()}"
 
 
-# =============================================================================
-# Transaction Status (the source of truth — always called, callback alone
-# is never sufficient to activate a subscription)
-# =============================================================================
+def create_paytm_payment(db: Session, user: User, plan_id: str, billing_cycle: str) -> Payment:
+    """Creates a pending Payment row for a checkout attempt. The route then
+    calls paytm_service.initiate_transaction and records the result via
+    record_gateway_init."""
 
-async def verify_transaction_status(order_id: str) -> dict:
-    """POST /v3/order/status — the authoritative check. Retries transient
-    failures the same as initiate_transaction; this is a read-only check
-    so retrying is unambiguously safe."""
+    pricing = pricing_service.resolve_plan(db, plan_id, billing_cycle)
 
-    body = {"mid": PAYTM_MID, "orderId": order_id}
-    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    checksum = _generate_signature_by_string(body_json, PAYTM_MERCHANT_KEY)
-    payload = {"body": body, "head": {"signature": checksum}}
+    payment = Payment(
+        user_id=user.id,
+        gateway="paytm",
+        status="pending",
+        order_id=_new_order_id(),
+        plan_id=pricing["plan_id"],
+        plan_name=pricing["plan_name"],
+        base_price=pricing["base_price"],
+        gst_rate=pricing["gst_rate"],
+        gst_amount=pricing["gst_amount"],
+        payable_amount=pricing["payable_amount"],
+        currency="INR",
+        customer_name=user.name,
+        customer_email=user.email,
+        customer_mobile=user.mobile,
+        customer_gstin=user.gstin,
+        customer_address=_billing_address(user),
+        gateway_response={"billing_cycle": billing_cycle},
+    )
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment
 
-    return await _post_with_retry(f"{BASE_URL}/v3/order/status", json_payload=payload)
+
+def record_gateway_init(db: Session, payment: Payment, txn_token: str, raw_response: dict) -> Payment:
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "txn_token": txn_token,
+        "init_response": raw_response,
+    }
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def mark_init_failed(db: Session, payment: Payment, reason: str, *, raw_response: Optional[dict] = None) -> Payment:
+    """Paytm's application layer explicitly rejected the request (bad
+    payload, invalid signature, business-rule rejection, etc). This is a
+    terminal state for the attempt — retrying the identical request is
+    expected to fail again the same way."""
+    payment.status = "failed"
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "init_error": reason,
+        **({"init_error_response": raw_response} if raw_response is not None else {}),
+    }
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def mark_init_gateway_error(
+    db: Session,
+    payment: Payment,
+    reason: str,
+    *,
+    status_code: Optional[int] = None,
+    body: Optional[str] = None,
+) -> Payment:
+    """Paytm's gateway was transiently unavailable (5xx/timeout/network
+    error) — the request was never confirmed accepted OR rejected. This is
+    deliberately NOT "failed": nothing about the payment itself is known
+    to be wrong, and a retry with the same order_id is safe (see
+    paytm_service._post_with_retry's docstring). Kept distinct from
+    "pending" too, so it's visible in the admin payments list which
+    attempts stalled on Paytm's side rather than a user simply not having
+    completed checkout yet."""
+    payment.status = "gateway_error"
+    payment.gateway_response = {
+        **(payment.gateway_response or {}),
+        "init_error": reason,
+        "init_error_status_code": status_code,
+        "init_error_body": (body or "")[:2000] or None,
+    }
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def get_by_order_id(db: Session, order_id: str) -> Payment:
+    payment = db.query(Payment).filter(Payment.order_id == order_id).first()
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
+    return payment
+
+
+def _activate_subscription_for_payment(db: Session, payment: Payment, billing_cycle: str) -> Subscription:
+    """Activates a subscription from a successful Paytm payment, using the
+    pricing snapshot already on the Payment row (what the user actually
+    paid) rather than a fresh CMS lookup."""
+
+    start = datetime.utcnow()
+    expiry = start + timedelta(days=subscription_service.CYCLE_DAYS.get(billing_cycle, 30))
+
+    sub = Subscription(
+        user_id=payment.user_id,
+        plan_id=payment.plan_id,
+        plan_name=payment.plan_name,
+        billing_cycle=billing_cycle,
+        base_price=payment.base_price,
+        gst_rate=payment.gst_rate,
+        gst_amount=payment.gst_amount,
+        payable_amount=payment.payable_amount,
+        status="active",
+        source="online",
+        start_date=start,
+        expiry_date=expiry,
+        notes=f"Activated by Paytm payment {payment.order_id}",
+    )
+    db.add(sub)
+    db.flush()
+
+    user = db.query(User).filter(User.id == payment.user_id).first()
+    if user:
+        user.plan = sub.plan_name
+
+    return sub
+
+
+def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) -> Payment:
+    """
+    Called only after a server-to-server call to Paytm's Transaction Status
+    API (the sole trustworthy source — see paytm_service module docstring).
+    Marks the Payment success/failed and, on success, activates a
+    Subscription. Idempotent — a payment already marked "success" is
+    returned as-is rather than double-activating a second subscription
+    (Paytm may deliver the callback more than once).
+    """
+
+    payment = get_by_order_id(db, order_id)
+
+    if payment.status == "success":
+        return payment
+
+    body = status_response.get("body", {}) if isinstance(status_response, dict) else {}
+    result_info = body.get("resultInfo", {}) if isinstance(body, dict) else {}
+    txn_status = result_info.get("resultStatus")  # TXN_SUCCESS | TXN_FAILURE | PENDING
+
+    payment.gateway_txn_id = body.get("txnId") or payment.gateway_txn_id
+    payment.gateway_response = {**(payment.gateway_response or {}), "status_response": status_response}
+
+    if txn_status == "TXN_SUCCESS":
+        payment.status = "success"
+        payment.paid_at = datetime.utcnow()
+        db.flush()  # allocate payment.id if this is somehow still transient
+        payment.invoice_number = payment.invoice_number or f"INV-{payment.id:06d}"
+        payment.receipt_number = payment.receipt_number or f"RCPT-{payment.id:06d}"
+
+        billing_cycle = (payment.gateway_response or {}).get("billing_cycle", "monthly")
+        subscription = _activate_subscription_for_payment(db, payment, billing_cycle)
+        payment.subscription_id = subscription.id
+
+        log_action(
+            db,
+            actor_id=payment.user_id,
+            action="payment.paytm_success",
+            target_type="payment",
+            target_id=payment.id,
+            new_value={"order_id": order_id, "subscription_id": subscription.id},
+        )
+    elif txn_status == "TXN_FAILURE":
+        payment.status = "failed"
+        log_action(
+            db,
+            actor_id=payment.user_id,
+            action="payment.paytm_failed",
+            target_type="payment",
+            target_id=payment.id,
+            new_value={"order_id": order_id, "reason": result_info.get("resultMsg")},
+        )
+    # else: still PENDING on Paytm's side — leave status as "pending" so a
+    # later recheck can pick it up; don't guess at an outcome Paytm hasn't
+    # confirmed yet.
+
+    db.commit()
+    db.refresh(payment)
+
+    if payment.status == "success":
+        if payment.subscription_id:
+            bridge_service.sync_subscription(db, db.get(Subscription, payment.subscription_id))
+        email_service.send_payment_receipt_email(
+            to=payment.customer_email,
+            name=payment.customer_name or "there",
+            plan_name=payment.plan_name,
+            amount=str(payment.payable_amount),
+            order_id=payment.order_id,
+        )
+        notification_service.notify_payment_completed(
+            db,
+            user_name=payment.customer_name or "A user",
+            plan_name=payment.plan_name,
+            amount=str(payment.payable_amount),
+            payment_id=payment.id,
+        )
+
+    return payment

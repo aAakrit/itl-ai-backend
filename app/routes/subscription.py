@@ -49,6 +49,7 @@ def list_subscriptions(
     expiry_window: Optional[str] = Query(None, description="expired | today | 7d | 30d | 60d | 90d"),
     expiry_from: Optional[datetime] = None,
     expiry_to: Optional[datetime] = None,
+    product: Optional[str] = Query(None, description="itl_ai | itl_bridge_ai"),
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
@@ -63,6 +64,7 @@ def list_subscriptions(
         expiry_window=expiry_window,
         expiry_from=expiry_from,
         expiry_to=expiry_to,
+        product=product,
     )
     return {
         **result,
