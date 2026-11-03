@@ -47,8 +47,21 @@ def my_status(user: User = Depends(get_current_user)):
     if not bridge.is_configured():
         return {"enabled": False, "status": None, "links": None}
 
-    status = _call(bridge.get_status, bridge.user_key(user.id))
-    links = _call(bridge.get_connect_links)
+    uid = bridge.user_key(user.id)
+    try:
+        status = bridge.get_status(uid)
+    except bridge.BridgeError as e:
+        if e.status != 404:
+            raise HTTPException(status_code=e.status if 400 <= e.status < 600 else 502, detail=e.message)
+        # Bridge has no record of this customer yet — same as "no plan".
+        status = {"user_id": uid, "exists": False, "active": False}
+
+    # The Connect buttons are a convenience; a failure here must not hide the plan status.
+    try:
+        links = bridge.get_connect_links()
+    except bridge.BridgeError:
+        links = None
+
     return {"enabled": True, "status": status, "links": links}
 
 
