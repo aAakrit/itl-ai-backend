@@ -29,7 +29,7 @@ from app.routes.payment import checkout_router as payment_checkout_router
 from app.routes.notification import router as admin_notification_router
 from app.routes.admin_logs import router as admin_logs_router
 from app.routes.bridge import router as bridge_router, admin_router as admin_bridge_router
-from app.services import bridge_service
+from app.services import bridge_service, payment_reconcile
 from app.models.ai import (
     AIConversation,
     AIProviderSession,
@@ -107,6 +107,12 @@ app.include_router(admin_notification_router)
 app.include_router(admin_logs_router)
 app.include_router(bridge_router)
 app.include_router(admin_bridge_router)
+
+
+@app.on_event("startup")
+async def start_payment_reconcile():
+    # Safety net: confirms paid Paytm orders whose browser never reported back.
+    asyncio.create_task(payment_reconcile.payment_reconcile_loop())
 
 
 @app.on_event("startup")

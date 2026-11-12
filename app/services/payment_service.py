@@ -21,7 +21,7 @@ from app.models.payment import Payment
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
-from app.services import pricing_service, subscription_service
+from app.services import bridge_service, pricing_service, subscription_service
 from app.services import email_service
 from app.services import notification_service
 from app.services.audit_service import log_action
@@ -331,9 +331,22 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
     (Paytm may deliver the callback more than once).
     """
 
-    payment = get_by_order_id(db, order_id)
+    # Row lock: the Paytm callback, a user recheck and the background
+    # reconciler can all land here for the same order at the same moment.
+    # populate_existing() re-reads the row so the "already success?" check
+    # below sees what the winner of the lock committed.
+    payment = (
+        db.query(Payment)
+        .filter(Payment.order_id == order_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found.")
 
     if payment.status == "success":
+        db.rollback()  # release the lock; nothing to change
         return payment
 
     body = status_response.get("body", {}) if isinstance(status_response, dict) else {}
@@ -380,6 +393,8 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
     db.refresh(payment)
 
     if payment.status == "success":
+        if payment.subscription_id:
+            bridge_service.sync_subscription(db, db.get(Subscription, payment.subscription_id))
         email_service.send_payment_receipt_email(
             to=payment.customer_email,
             name=payment.customer_name or "there",

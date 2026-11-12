@@ -13,7 +13,7 @@ from app.db import SessionLocal
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
 from app.schemas.subscription import CashPaymentCreate, PaymentInitiateRequest, PaymentInitiateResponse, PaymentResponse
-from app.services import invoice_service
+from app.services import invoice_service, payment_reconcile
 from app.services import payment_service as service
 from app.services import paytm_service
 
@@ -327,6 +327,19 @@ async def paytm_callback(request: Request, db: Session = Depends(get_db)):
         url=f"{FRONTEND_URL}/billing/return?status={payment.status}&order_id={order_id}",
         status_code=303,
     )
+
+
+@checkout_router.post("/recheck-pending")
+async def recheck_my_pending_payments(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Asks Paytm about the signed-in customer's own pending payments (last 24 h)
+    and activates the plan for any that were actually paid. Called when the
+    billing page opens, so a payment whose browser confirmation was lost is
+    picked up as soon as the customer comes back."""
+
+    return await payment_reconcile.reconcile_pending(db, user_id=user.id)
 
 
 @checkout_router.get("/{order_id}/status", response_model=PaymentResponse)
