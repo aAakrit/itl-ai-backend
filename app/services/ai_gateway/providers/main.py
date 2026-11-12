@@ -15,8 +15,8 @@ class MainProvider(BaseProvider):
     Provider for the Main AI service.
     """
 
-    def __init__(self):
-        super().__init__(AI_MAIN_URL)
+    def __init__(self, base_url: str | None = None):
+        super().__init__(base_url or AI_MAIN_URL)
 
     async def query(self, payload: dict[str, Any]) -> dict:
         """
@@ -24,6 +24,18 @@ class MainProvider(BaseProvider):
         """
         return await self.post(
             endpoint=MainEndpoints.QUERY,
+            payload=payload,
+        )
+
+    def stream_query(self, payload: dict[str, Any]):
+        """
+        Streamed research: async iterator of (event_type, data) from
+        POST /api/v1/query/stream. The `final` event carries the same JSON
+        as the normal /api/v1/query response.
+        """
+        return self.client.stream_sse(
+            base_url=self.base_url,
+            endpoint=MainEndpoints.QUERY_STREAM,
             payload=payload,
         )
 

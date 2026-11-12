@@ -19,6 +19,24 @@ AI_FREE_URL = os.getenv("AI_FREE_URL")
 AI_NOTICE_URL = os.getenv("AI_NOTICE_URL")
 AI_SUMMARIZER_URL = os.getenv("AI_SUMMARIZER_URL")
 AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", 180))
+
+# Income Tax services (module "income-tax"). Optional: a module only switches
+# to the IT service when its URL is set, otherwise it keeps using the GST
+# service exactly as before.
+#   AI_IT_ASK_URL      IT Ask Bot            e.g. http://localhost:5033
+#   AI_IT_CASELAW_URL  IT Case Law Research  e.g. http://localhost:5034
+AI_IT_ASK_URL = os.getenv("AI_IT_ASK_URL") or None
+AI_IT_CASELAW_URL = os.getenv("AI_IT_CASELAW_URL") or None
+
+# Streamed research (SSE): max seconds of silence from the AI service before
+# the stream is treated as dead. The service sends a keep-alive every ~15 s.
+AI_STREAM_READ_TIMEOUT = int(os.getenv("AI_STREAM_READ_TIMEOUT", 90))
+
+# Stream the GST Ask Bot too? Off by default: the stream endpoint is a v1-style
+# call, while GST conversations get their memory from vendor v2 sessions, so
+# streaming could drop earlier-turn context there. The Income Tax Ask Bot takes
+# `history` directly, so it always streams (when its URL is configured).
+AI_STREAM_GST = os.getenv("AI_STREAM_GST", "false").lower() == "true"
 AI_RENDER_MARKDOWN = (
     os.getenv("AI_RENDER_MARKDOWN", "true").lower() == "true"
 )
@@ -29,6 +47,11 @@ PAYTM_MERCHANT_KEY = os.getenv("PAYTM_MERCHANT_KEY", "")
 PAYTM_CALLBACK_URL = os.getenv("PAYTM_CALLBACK_URL", "")
 PAYTM_ENV = os.getenv("PAYTM_ENV", "staging").lower()
 PAYTM_WEBSITE = os.getenv("PAYTM_WEBSITE") or ("DEFAULT" if PAYTM_ENV == "production" else "WEBSTAGING")
+
+# Optional override of Paytm's API / checkout-script host, e.g. the legacy
+# "https://securegw.paytm.in" that the previous (working) ITL site used in
+# production. Leave empty to use the current default for PAYTM_ENV.
+PAYTM_BASE_URL = os.getenv("PAYTM_BASE_URL", "").strip().rstrip("/")
 
 # Where the Paytm callback route redirects the browser back to once a
 # payment is finalized — the frontend's own return/receipt page.

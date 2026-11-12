@@ -63,6 +63,10 @@ class ClarifyRequest(BaseModel):
     # must tell us which tool's Clarify button was clicked.
     provider: str = "main"
 
+    # Tax Module the Clarify button was clicked in ("income-tax" uses the
+    # Income Tax bots when they're configured). Optional: omitted = as before.
+    module_id: str | None = None
+
 
 class RefineRequest(BaseModel):
     """

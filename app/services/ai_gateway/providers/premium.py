@@ -18,8 +18,8 @@ class PremiumProvider(BaseProvider):
     Provider for the Premium Judgment AI service.
     """
 
-    def __init__(self):
-        super().__init__(AI_PREMIUM_URL)
+    def __init__(self, base_url: str | None = None):
+        super().__init__(base_url or AI_PREMIUM_URL)
 
     async def search(self, payload: AIQueryRequest) -> dict:
         return await self.post(

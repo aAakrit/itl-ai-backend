@@ -7,8 +7,12 @@ from sqlalchemy.orm import Session
 from app.models.ai import AIConversation, AIMessage
 from app.models.ai import AIProviderSession
 
-from app.services.ai_service import ai_service
-from app.services.ai_gateway.exceptions import AIResponseException
+from app.config import AI_STREAM_GST
+from app.services.ai_service import ai_service, ai_service_for_module
+from app.services.ai_gateway.exceptions import (
+    AIConnectionException,
+    AIResponseException,
+)
 from app.utils import storage
 
 logger = logging.getLogger(__name__)
@@ -50,6 +54,58 @@ class ChatService:
     def __init__(self, db):
         self.db = db
         self.ai_service = ai_service
+
+    # ------------------------------------------------------------------
+    # Module routing — Income Tax services vs the existing (GST) services
+    # ------------------------------------------------------------------
+
+    def _use_module(self, module: Optional[str]) -> None:
+        """
+        Points this request at the Income Tax services when the conversation
+        belongs to the "income-tax" module AND an IT service URL is
+        configured; otherwise leaves the existing service untouched.
+        ChatService is created per request, so this never leaks across users.
+        """
+        self.ai_service = ai_service_for_module(module)
+
+    @property
+    def _is_it(self) -> bool:
+        return bool(getattr(self.ai_service, "is_it", False))
+
+    def _build_history(
+        self,
+        conversation_id: int,
+        limit: int = 6,
+        max_answer_chars: int = 4000,
+    ) -> list[dict]:
+        """
+        Previous turns as [{"q", "a"}] for the Income Tax bots, which take
+        history directly instead of keeping a vendor-side session.
+        """
+        rows = (
+            self.db.query(AIMessage)
+            .filter(AIMessage.conversation_id == conversation_id)
+            .order_by(AIMessage.id)
+            .all()
+        )
+        pairs: list[dict] = []
+        last_query: Optional[str] = None
+        for row in rows:
+            if row.message_type == "user":
+                last_query = row.query
+            elif row.message_type in ("assistant", "refinement") and last_query and row.answer:
+                pairs.append({"q": last_query, "a": row.answer[:max_answer_chars]})
+                last_query = None
+        return pairs[-limit:]
+
+    @staticmethod
+    def _act_fields(response: Optional[dict]) -> dict:
+        """Which Act the Income Tax bots applied (shown as a small badge)."""
+        response = response or {}
+        return {
+            "governing_act": response.get("governing_act"),
+            "act_basis": response.get("act_basis"),
+        }
 
     @staticmethod
     def _derive_title(query: str, max_length: int = 60) -> str:
@@ -169,7 +225,7 @@ class ChatService:
         token = None
         metadata: dict = {}
 
-        if provider == "main":
+        if provider == "main" and not self._is_it:
             try:
                 # Vendor request contract for POST /api/v2/sessions isn't
                 # fully specified in any doc shared so far (only that it
@@ -505,6 +561,8 @@ class ChatService:
                     "citation": card.get("citation"),
                     "similarity": card.get("similarity_score"),
                     "link": card.get("link"),
+                    "binding_status": card.get("binding_status"),
+                    "cross_act": card.get("cross_act"),
                 }
 
             def statute_source(card: dict) -> dict:
@@ -544,6 +602,8 @@ class ChatService:
                     "held": c.get("held"),
                     "ratio": c.get("ratio"),
                     "link": c.get("link"),
+                    "binding_status": c.get("binding_status"),
+                    "cross_act": c.get("cross_act"),
                 }
                 for c in response.get("enhanced_related") or []
             ]
@@ -821,6 +881,8 @@ class ChatService:
             .first()
         )
 
+        self._use_module(conversation.module)
+
         provider_session = await self.get_or_create_provider_session(
             conversation_id=conversation.id,
             provider=message.provider,
@@ -1029,6 +1091,9 @@ class ChatService:
             "created_at": message.created_at,
         }
 
+        if not is_user:
+            data.update(self._act_fields(message.raw_response))
+
         # Notice Agent staged workflow (§C) — persisted on assistant turns
         # so "reopen conversation" can restore the correct stage and offer
         # refine on the latest revision without replaying every message.
@@ -1104,6 +1169,7 @@ class ChatService:
     ) -> dict:
 
         payload = payload or {}
+        self._use_module(module)
 
         try:
             # ---------------------------------------------------------
@@ -1184,6 +1250,16 @@ class ChatService:
                     "message_id": user_message.id,
                 }
 
+            if self._is_it and (
+                (provider == "main" and tool == "chat") or (provider == "premium" and tool == "search")
+            ):
+                # Income Tax bots keep no vendor-side session: earlier turns
+                # are sent along as {q, a} pairs instead.
+                provider_payload["history"] = self._build_history(conversation.id)
+                provider_payload.pop("message_id", None)  # not part of the IT contract
+                if provider == "main" and payload.get("deep_research"):
+                    provider_payload["deep_research"] = True
+
             if provider_session.provider_session_token and not (provider == "premium" and tool == "search"):
                 # Real vendor session token (see get_or_create_provider_session)
                 # — this is what actually gives the vendor bot memory of prior
@@ -1263,12 +1339,207 @@ class ChatService:
                     "related_judgements": assistant_message.related_judgements,
                     "needs_clarification": assistant_message.needs_clarification,
                     "deep_research_used": assistant_message.deep_research_used,
+                    **self._act_fields(assistant_message.raw_response),
                     "created_at": assistant_message.created_at,
                 },
             }
 
         except Exception:
             self.db.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Streamed research (Ask Bot) — events relayed as they arrive
+    # ------------------------------------------------------------------
+
+    def _query_result(self, conversation, user_message, assistant_message) -> dict:
+        """The same result shape query() returns — used by the streamed path."""
+        return {
+            "conversation": {
+                "id": conversation.id,
+                "title": conversation.title,
+                "provider": conversation.provider,
+                "tool": conversation.tool,
+                "updated_at": conversation.updated_at,
+                "last_message_at": conversation.last_message_at,
+            },
+            "user_message": {
+                "id": user_message.id,
+                "query": user_message.query,
+                "created_at": user_message.created_at,
+            },
+            "assistant_message": {
+                "id": assistant_message.id,
+                "answer": assistant_message.answer,
+                "query_time_ms": assistant_message.query_time_ms,
+                "sources": assistant_message.sources,
+                "related_judgements": assistant_message.related_judgements,
+                "needs_clarification": assistant_message.needs_clarification,
+                "deep_research_used": assistant_message.deep_research_used,
+                **self._act_fields(assistant_message.raw_response),
+                "created_at": assistant_message.created_at,
+            },
+        }
+
+    def _discard_empty_conversation(self, conversation_id: int) -> None:
+        """A stopped/failed first message must not leave an empty chat behind."""
+        try:
+            if self.db.query(AIMessage).filter(AIMessage.conversation_id == conversation_id).count():
+                return
+            self.db.query(AIProviderSession).filter(
+                AIProviderSession.conversation_id == conversation_id
+            ).delete()
+            self.db.query(AIConversation).filter(AIConversation.id == conversation_id).delete()
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.warning("Could not discard empty conversation %s", conversation_id, exc_info=True)
+
+    async def query_stream(
+        self,
+        *,
+        user_id: int,
+        query: str,
+        provider: str = "main",
+        tool: str = "chat",
+        module: str = "gst",
+        conversation_id: Optional[int] = None,
+        payload: Optional[dict] = None,
+    ):
+        """
+        Async generator of {"event": str, "data": ...}.
+
+        Progress events (plan / tools / step / status / answer_delta) are
+        passed through untouched. The vendor's `final` event is turned into
+        {"payload": <vendor JSON>, "result": <same shape query() returns>}
+        after the exchange has been saved. Nothing is saved when the run is
+        stopped or fails — the user's message and the answer are stored
+        together, once, at the end.
+
+        If the AI service has no stream endpoint (or can't be reached for
+        it), the normal query() path answers instead, so the caller always
+        ends with exactly one `final` event.
+        """
+
+        payload = payload or {}
+        self._use_module(module)
+
+        # Only the Ask Bot streams; every other tool answers with one normal
+        # call. GST streams only when AI_STREAM_GST is on (see config.py).
+        if not (provider == "main" and tool == "chat") or not (self._is_it or AI_STREAM_GST):
+            result = await self.query(
+                user_id=user_id, query=query, provider=provider, tool=tool,
+                module=module, conversation_id=conversation_id, payload=payload,
+            )
+            yield {"event": "final", "data": {"payload": None, "result": result}}
+            return
+
+        conversation = self.get_or_create_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            provider=provider,
+            tool=tool,
+            module=module,
+            title=self._derive_title(query),
+        )
+        created_here = conversation.id != conversation_id
+        completed = False
+
+        try:
+            provider_session = await self.get_or_create_provider_session(
+                conversation_id=conversation.id,
+                provider=provider,
+            )
+
+            stream_payload = {
+                "query": query,
+                "max_results": payload.get("max_results", 5),
+                "session_id": conversation.id,
+            }
+            if provider_session.provider_session_token:
+                stream_payload["session_token"] = provider_session.provider_session_token
+            if self._is_it:
+                stream_payload["history"] = self._build_history(conversation.id)
+            if payload.get("deep_research"):
+                stream_payload["deep_research"] = True
+
+            final_payload: Optional[dict] = None
+            started = False
+
+            try:
+                async for event, data in self.ai_service.main.stream_query(stream_payload):
+                    if event == "keepalive":
+                        yield {"event": "keepalive", "data": None}
+                        continue
+                    started = True
+                    if event == "final":
+                        final_payload = (data or {}).get("payload", data)
+                        break
+                    if event == "error":
+                        message = (data or {}).get("message") if isinstance(data, dict) else None
+                        raise AIResponseException(
+                            status_code=502,
+                            detail=message or "The research service reported an error.",
+                        )
+                    yield {"event": event, "data": data}
+            except (AIResponseException, AIConnectionException) as exc:
+                # Failed to OPEN the stream (no endpoint, 5xx, refused): answer with the
+                # normal call instead. Once events have flowed, errors are real errors.
+                if started:
+                    raise
+                # No stream endpoint on this service — answer with the normal call.
+                result = await self.query(
+                    user_id=user_id, query=query, provider=provider, tool=tool,
+                    module=module, conversation_id=conversation.id, payload=payload,
+                )
+                completed = True
+                yield {"event": "final", "data": {"payload": None, "result": result}}
+                return
+
+            if not isinstance(final_payload, dict):
+                raise AIResponseException(
+                    status_code=502,
+                    detail="The research stream ended without an answer.",
+                )
+
+            self._raise_if_pipeline_error(final_payload)
+
+            self.save_provider_session_token(provider_session=provider_session, response=final_payload)
+
+            user_message = self.save_user_message(
+                conversation_id=conversation.id,
+                provider=provider,
+                query=query,
+                parent_message_id=None,
+            )
+            assistant_message = self.save_ai_message(
+                conversation_id=conversation.id,
+                provider=provider,
+                response=self._normalize_provider_response(tool, final_payload),
+                parent_message_id=user_message.id,
+            )
+            self.update_conversation(conversation=conversation, provider=provider)
+            self.db.commit()
+
+            self.db.refresh(conversation)
+            self.db.refresh(user_message)
+            self.db.refresh(assistant_message)
+            completed = True
+
+            yield {
+                "event": "final",
+                "data": {
+                    "payload": final_payload,
+                    "result": self._query_result(conversation, user_message, assistant_message),
+                },
+            }
+
+        except BaseException:
+            # Includes cancellation (Stop button / closed tab): save nothing,
+            # and don't leave an empty chat behind for a brand-new conversation.
+            self.db.rollback()
+            if created_here and not completed:
+                self._discard_empty_conversation(conversation.id)
             raise
 
     # ------------------------------------------------------------------

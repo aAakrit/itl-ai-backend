@@ -7,6 +7,7 @@ Keeping endpoint paths here avoids hardcoding URLs across providers.
 
 class MainEndpoints:
     QUERY = "/api/v1/query"
+    QUERY_STREAM = "/api/v1/query/stream"
     QUERY_V2 = "/api/v2/query"
 
     CASE_LAWS = "/api/v1/case-laws"

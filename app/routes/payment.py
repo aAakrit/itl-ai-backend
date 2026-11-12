@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.config import FRONTEND_URL
+from app.config import FRONTEND_URL as _FRONTEND_URL
 from app.db import SessionLocal
 from app.models.user import User
 from app.routes.auth import get_current_user, require_admin
@@ -18,6 +18,10 @@ from app.services import payment_service as service
 from app.services import paytm_service
 
 logger = logging.getLogger(__name__)
+
+# FRONTEND_URL is configured with a trailing slash ("https://site/"); the redirects below
+# append "/billing/return", which produced "https://site//billing/return".
+FRONTEND_URL = _FRONTEND_URL.rstrip("/")
 
 router = APIRouter(
     prefix="/admin/payments",
@@ -274,6 +278,9 @@ async def initiate_payment(
             # Not a redirect URL; there's no page navigation involved.
             "scriptUrl": paytm_service.checkout_script_url(),
             "isStaging": paytm_service.PAYTM_ENV != "production",
+            # False = no callbackUrl was sent: run the checkout with redirect:false
+            # and report the result from the page (see billing.tsx).
+            "useCallback": paytm_service.use_callback(),
         },
     )
 

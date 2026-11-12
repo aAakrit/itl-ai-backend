@@ -8,13 +8,19 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.config import AI_IT_ASK_URL, AI_IT_CASELAW_URL
 from app.services.ai_gateway.gateway import ai_gateway
+from app.services.ai_gateway.providers.main import MainProvider
+from app.services.ai_gateway.providers.premium import PremiumProvider
 
 
 class AIService:
     """
     Business service for all AI operations.
     """
+
+    # True only on the Income Tax instance (see _build_it_service).
+    is_it = False
 
     def __init__(self):
         self.main = ai_gateway.get_provider("main")
@@ -172,3 +178,32 @@ class AIService:
         return await ai_gateway.get_provider(provider).health()
 
 ai_service = AIService()
+
+
+def _build_it_service() -> "AIService | None":
+    """
+    Income Tax variant of the service: same API as the GST bots, different
+    base URLs. Only the services whose URL is configured are swapped; every
+    other tool (notice, summarizer, ...) keeps using the existing providers.
+    Returns None when no IT URL is configured, so nothing changes.
+    """
+    if not (AI_IT_ASK_URL or AI_IT_CASELAW_URL):
+        return None
+
+    svc = AIService()
+    if AI_IT_ASK_URL:
+        svc.main = MainProvider(AI_IT_ASK_URL)
+    if AI_IT_CASELAW_URL:
+        svc.premium = PremiumProvider(AI_IT_CASELAW_URL)
+    svc.is_it = True
+    return svc
+
+
+it_ai_service = _build_it_service()
+
+
+def ai_service_for_module(module: str | None) -> "AIService":
+    """The Income Tax service for module "income-tax" (when configured), else the default."""
+    if module == "income-tax" and it_ai_service is not None:
+        return it_ai_service
+    return ai_service

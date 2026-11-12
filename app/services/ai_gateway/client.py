@@ -16,11 +16,12 @@ Providers are responsible for deciding which endpoint to call.
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, AsyncIterator
 
 import httpx
 
-from app.config import AI_TIMEOUT
+from app.config import AI_STREAM_READ_TIMEOUT, AI_TIMEOUT
 from .exceptions import (
     AIConnectionException,
     AIResponseException,
@@ -175,6 +176,72 @@ class GatewayClient:
 
         except Exception as exc:
             self._handle_exception(exc)
+
+    async def stream_sse(
+        self,
+        base_url: str,
+        endpoint: str,
+        payload: dict[str, Any],
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """
+        POST a JSON body and yield Server-Sent Events as (event_type, data).
+
+        Keep-alive comment lines are yielded as ("keepalive", None) so the
+        caller can pass them on. Raises AIResponseException when the service
+        answers with a non-200 status (e.g. the stream endpoint doesn't exist
+        on that service) so the caller can fall back to the normal call.
+        Leaving the `async for` early (client disconnect, Stop button) closes
+        the HTTP connection, which is how the AI service learns to cancel.
+        """
+
+        url = self._build_url(base_url, endpoint)
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=float(AI_STREAM_READ_TIMEOUT),
+            write=60.0,
+            pool=10.0,
+        )
+
+        try:
+            async with self._client.stream(
+                "POST",
+                url,
+                json=payload,
+                timeout=timeout,
+                headers={"Accept": "text/event-stream"},
+            ) as response:
+                if response.status_code != 200:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    raise AIResponseException(
+                        status_code=response.status_code,
+                        detail=body[:500],
+                    )
+
+                event_type = "message"
+                data_lines: list[str] = []
+
+                async for line in response.aiter_lines():
+                    if line == "":
+                        if data_lines:
+                            raw = "\n".join(data_lines)
+                            try:
+                                data = json.loads(raw)
+                            except ValueError:
+                                data = {"text": raw}
+                            yield event_type, data
+                        event_type = "message"
+                        data_lines = []
+                    elif line.startswith(":"):
+                        yield "keepalive", None
+                    elif line.startswith("event:"):
+                        event_type = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+
+        except httpx.TimeoutException as exc:
+            raise AITimeoutException(str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise AIConnectionException(str(exc)) from exc
 
     async def health(
         self,

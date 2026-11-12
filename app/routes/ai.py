@@ -4,6 +4,9 @@ AI Routes
 Exposes endpoints for interacting with external AI services.
 """
 
+import asyncio
+import json
+import logging
 import os
 import time
 from datetime import datetime
@@ -24,7 +27,10 @@ from fastapi import (
     status,
 )
 from fastapi import Depends
-from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
+from app.db import SessionLocal
+from app.services.ai_gateway.exceptions import AIResponseException, AIServiceException
 from app.utils import storage
 from app.schemas.ai import (
     AIQueryRequest,
@@ -44,13 +50,15 @@ from app.schemas.ai import (
     SessionCreateRequest,
     SimilarRequest,
 )
-from app.services.ai_service import ai_service
+from app.services.ai_service import ai_service, ai_service_for_module
 from app.utils.response import success_response
 
 router = APIRouter(
     prefix="/ai",
     tags=["AI"],
 )
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Main AI
@@ -82,6 +90,72 @@ async def query(
     return success_response(
         data=result,
         message="Query processed successfully.",
+    )
+
+
+def _sse(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(jsonable_encoder(data))}\n\n"
+
+
+@router.post(
+    "/query/stream",
+    summary="Query Main AI (streamed)",
+    description=(
+        "Same request as /ai/query, answered as Server-Sent Events: plan / tools / "
+        "step / status / answer_delta progress events, then one `final` event whose "
+        "`data.result` has the same shape /ai/query returns, then the stream ends."
+    ),
+)
+async def query_stream(
+    request: AIQueryRequest,
+    current_user: User = Depends(get_current_user),
+):
+    user_id = current_user.id
+    body = request.dict()
+
+    async def event_source():
+        # Own DB session: it must stay open for the whole (minutes-long) stream,
+        # independent of the request-scoped dependency lifecycle.
+        db = SessionLocal()
+        chat = ChatService(db)
+        try:
+            yield ": open\n\n"  # flush headers through proxies immediately
+            async for item in chat.query_stream(
+                user_id=user_id,
+                provider=request.provider,
+                tool=request.tool,
+                module=request.module_id,
+                query=request.query,
+                conversation_id=request.conversation_id,
+                payload=body,
+            ):
+                if item["event"] == "keepalive":
+                    yield ": keepalive\n\n"
+                else:
+                    yield _sse(item["event"], item["data"])
+        except asyncio.CancelledError:
+            # Client closed the stream (Stop / navigation): closing the AI
+            # connection above is what cancels the run on the AI side.
+            raise
+        except AIResponseException as exc:
+            logger.warning("Streamed query failed: %s", exc)
+            yield _sse("error", {"message": str(exc.detail)[:300]})
+        except AIServiceException as exc:
+            logger.warning("Streamed query failed: %s", exc)
+            yield _sse("error", {"message": exc.message})
+        except Exception:
+            logger.exception("Streamed query crashed")
+            yield _sse("error", {"message": "Unable to generate a response. Please try again."})
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # nginx: don't buffer this response
+        },
     )
 
 
@@ -118,10 +192,11 @@ async def clarify(request: ClarifyRequest):
     # Provider-routed: was previously always calling main's /api/v1/clarify
     # even when the active tool was Case Law Research, which needs
     # /api/judgements/premium/clarify/ instead.
+    service = ai_service_for_module(request.module_id)
     if request.provider == "premium":
-        result = await ai_service.premium_clarify(request.dict(exclude={"provider"}))
+        result = await service.premium_clarify(request.dict(exclude={"provider", "module_id"}))
     else:
-        result = await ai_service.clarify(request.dict(exclude={"provider"}))
+        result = await service.clarify(request.dict(exclude={"provider", "module_id"}))
 
     return success_response(
         data=result,
