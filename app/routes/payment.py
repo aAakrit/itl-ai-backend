@@ -119,29 +119,43 @@ def get_payment_receipt(
     )
 
 
+@router.get("/{payment_id}/bill")
+def get_payment_bill(
+    payment_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """The GST bill (tax invoice) issued for this payment, as a PDF."""
+    from app.services import bill_pdf, bill_service
+
+    payment = service.get(db, payment_id)
+    bill = bill_service.get_for_payment(db, payment.id)
+    if not bill:
+        raise HTTPException(status_code=404, detail="No bill has been issued for this payment yet.")
+    filename = f"Bill-{bill.bill_number.replace('/', '-')}.pdf"
+    return StreamingResponse(
+        io.BytesIO(bill_pdf.build_bill_pdf(bill)),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # =============================================================================
 # User-facing checkout
 # =============================================================================
 
-@checkout_router.post("/initiate", response_model=PaymentInitiateResponse)
-async def initiate_payment(
-    payload: PaymentInitiateRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Creates a pending Payment, opens a Paytm transaction for it, and
-    returns everything the frontend needs to redirect into Paytm's hosted
-    checkout page."""
-
-    payment = service.create_paytm_payment(db, user, payload.plan_id, payload.billing_cycle)
+async def start_paytm_transaction(db: Session, payment) -> PaymentInitiateResponse:
+    """Opens a Paytm transaction for an already-created pending Payment and returns what the
+    frontend's Paytm JS checkout needs. Shared by /payments/initiate (logged-in customers)
+    and /checkout/initiate (the pricing-page dialog)."""
 
     try:
         result = await paytm_service.initiate_transaction(
             order_id=payment.order_id,
             amount=str(payment.payable_amount),
-            customer_id=str(user.id),
-            email=user.email,
-            mobile=user.mobile,
+            customer_id=str(payment.user_id),
+            email=payment.customer_email,
+            mobile=payment.customer_mobile,
         )
     except paytm_service.PaytmGatewayError as e:
         # Transient — Paytm's gateway itself was unreachable/erroring after
@@ -283,6 +297,18 @@ async def initiate_payment(
             "useCallback": paytm_service.use_callback(),
         },
     )
+
+
+@checkout_router.post("/initiate", response_model=PaymentInitiateResponse)
+async def initiate_payment(
+    payload: PaymentInitiateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Creates a pending Payment (list price) and opens a Paytm transaction for it."""
+
+    payment = service.create_paytm_payment(db, user, payload.plan_id, payload.billing_cycle)
+    return await start_paytm_transaction(db, payment)
 
 
 @checkout_router.post("/paytm/callback")

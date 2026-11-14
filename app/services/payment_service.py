@@ -9,8 +9,10 @@ go through finalize_paytm_payment rather than the admin-only
 SubscriptionCreateManual schema — see that function's docstring.
 """
 
+import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import HTTPException
@@ -20,11 +22,16 @@ from sqlalchemy.orm import Session
 from app.models.payment import Payment
 from app.models.subscription import Subscription
 from app.models.user import User
-from app.schemas.subscription import CashPaymentCreate, SubscriptionCreateManual
-from app.services import bridge_service, pricing_service, subscription_service
+from app.schemas.subscription import CashPaymentCreate
+from app.config import PAYMENT_ALERT_EMAIL
+from app.services import bill_pdf, bill_service, bridge_service, coupon_service, invoice_service
+from app.services import pricing_service, subscription_service
 from app.services import email_service
 from app.services import notification_service
+from app.services import products as product_service
 from app.services.audit_service import log_action
+
+logger = logging.getLogger(__name__)
 
 PAYMENT_STATUSES = {"pending", "success", "failed", "gateway_error", "refunded"}
 PAYMENT_GATEWAYS = {"paytm", "cash", "complimentary"}
@@ -97,51 +104,86 @@ def list_payments(
     return {"items": items, "total": total, "page": page, "limit": limit}
 
 
+def _customer_snapshot_from_user(user: User) -> dict:
+    return dict(
+        customer_name=user.name,
+        customer_email=user.email,
+        customer_mobile=user.mobile,
+        customer_gstin=user.gstin,
+        customer_firm=user.firm,
+        customer_address=user.address,
+        customer_city=user.city,
+        customer_state=user.state,
+        customer_pin=user.pin_code,
+    )
+
+
+def _price_fields(plan: dict, split: dict, list_price: Decimal, discount_source: Optional[str]) -> dict:
+    discount = (list_price - split["base_price"]).quantize(Decimal("0.01"))
+    return dict(
+        plan_id=plan["plan_id"],
+        plan_name=plan["plan_name"],
+        products=plan["products"],
+        term_years=plan["term_years"],
+        list_price=list_price,
+        discount_amount=discount if discount > 0 else Decimal("0.00"),
+        discount_source=discount_source if discount > 0 else None,
+        base_price=split["base_price"],
+        gst_rate=split["gst_rate"],
+        gst_amount=split["gst_amount"],
+        payable_amount=split["payable_amount"],
+        cgst_amount=split["cgst_amount"],
+        sgst_amount=split["sgst_amount"],
+        igst_amount=split["igst_amount"],
+        currency="INR",
+    )
+
+
 def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) -> Payment:
-    """Records an offline/cash payment and activates the subscription it pays for."""
+    """Records an offline/cash payment, activates what it paid for, and issues the bill."""
 
     user = db.query(User).filter(User.id == payload.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
 
-    sub_payload = SubscriptionCreateManual(
-        user_id=payload.user_id,
-        plan_id=payload.plan_id,
-        billing_cycle=payload.billing_cycle,
+    plan = pricing_service.resolve_plan(db, payload.plan_id)
+    list_price = plan["base_price"]
+    base = pricing_service.money(payload.override_base_price) if payload.override_base_price is not None else list_price
+    if base <= 0:
+        raise HTTPException(status_code=400, detail="The price must be greater than zero.")
+    split = pricing_service.tax_split(base, user.state)
+
+    subscription = subscription_service.activate_purchase(
+        db,
+        user_id=user.id,
+        plan=plan,
+        amounts=split,
         source="manual",
-        override_base_price=payload.override_base_price,
+        admin_id=admin_id,
         notes=payload.payment_notes,
     )
-    subscription = subscription_service.create_manual(db, admin_id, sub_payload)
 
     payment = Payment(
-        user_id=payload.user_id,
+        user_id=user.id,
         subscription_id=subscription.id,
         gateway="cash",
         status="success",
         order_id=f"CASH-{uuid.uuid4().hex[:16].upper()}",
-        plan_id=subscription.plan_id,
-        plan_name=subscription.plan_name,
-        base_price=subscription.base_price,
-        gst_rate=subscription.gst_rate,
-        gst_amount=subscription.gst_amount,
-        payable_amount=subscription.payable_amount,
-        currency="INR",
-        customer_name=user.name,
-        customer_email=user.email,
-        customer_mobile=user.mobile,
-        customer_gstin=user.gstin,
-        customer_address=_billing_address(user),
+        salesman_id=payload.salesman_id,
+        price_override_reason=payload.payment_notes if base != list_price else None,
         recorded_by_admin_id=admin_id,
         payment_notes=payload.payment_notes,
         paid_at=datetime.utcnow(),
+        gateway_response={"billing_cycle": plan["billing_cycle"]},
+        **_price_fields(plan, split, list_price, "salesman" if payload.salesman_id else "admin"),
+        **_customer_snapshot_from_user(user),
     )
     db.add(payment)
     db.flush()
 
     # Allocated after flush so the payment's own id can be embedded.
-    payment.invoice_number = f"INV-CASH-{payment.id:06d}"
     payment.receipt_number = f"RCPT-CASH-{payment.id:06d}"
+    bill_service.create_for_payment(db, payment)  # sets payment.invoice_number
 
     log_action(
         db,
@@ -153,6 +195,7 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
             "subscription_id": subscription.id,
             "amount": str(payment.payable_amount),
             "plan_id": payment.plan_id,
+            "invoice_number": payment.invoice_number,
         },
         reason=payload.payment_notes,
     )
@@ -160,22 +203,72 @@ def record_cash_payment(db: Session, admin_id: int, payload: CashPaymentCreate) 
     db.commit()
     db.refresh(payment)
 
-    email_service.send_payment_receipt_email(
-        to=user.email,
-        name=user.name,
-        plan_name=payment.plan_name,
-        amount=str(payment.payable_amount),
-        order_id=payment.order_id,
-    )
-    notification_service.notify_payment_completed(
-        db,
-        user_name=user.name,
-        plan_name=payment.plan_name,
-        amount=str(payment.payable_amount),
-        payment_id=payment.id,
-    )
-
+    _after_success(db, payment)
     return payment
+
+
+def _build_attachments(db: Session, payment: Payment) -> list[tuple[str, bytes, str]]:
+    """Bill + receipt PDFs for e-mails. Best effort — a PDF problem must never undo a payment."""
+    out: list[tuple[str, bytes, str]] = []
+    try:
+        bill = bill_service.get_for_payment(db, payment.id)
+        if bill:
+            out.append((f"Bill-{bill.bill_number.replace('/', '-')}.pdf", bill_pdf.build_bill_pdf(bill), "application/pdf"))
+        data, content_type, filename = invoice_service.build_receipt(payment, "pdf")
+        out.append((filename, data, content_type))
+    except Exception:
+        logger.exception("Couldn't build bill/receipt attachments for payment %s", payment.id)
+    return out
+
+
+def _after_success(db: Session, payment: Payment) -> None:
+    """Everything that happens after a payment is committed as successful. Never raises."""
+    try:
+        sub = db.get(Subscription, payment.subscription_id) if payment.subscription_id else None
+        if sub:
+            bridge_service.sync_subscription(db, sub)
+
+        user = db.query(User).filter(User.id == payment.user_id).first()
+        attachments = _build_attachments(db, payment)
+        amount = f"{Decimal(payment.payable_amount):.2f}"
+
+        email_service.send_payment_receipt_email(
+            to=payment.customer_email,
+            name=payment.customer_name or "there",
+            plan_name=payment.plan_name,
+            amount=amount,
+            order_id=payment.order_id,
+            attachments=attachments,
+        )
+
+        salesman = None
+        if payment.salesman_id:
+            sm = db.query(User).filter(User.id == payment.salesman_id).first()
+            salesman = sm.name if sm else None
+        email_service.send_payment_alert_email(
+            to=PAYMENT_ALERT_EMAIL,
+            customer_name=payment.customer_name or "—",
+            customer_email=payment.customer_email or "—",
+            customer_mobile=payment.customer_mobile,
+            plan_name=payment.plan_name,
+            amount=amount,
+            order_id=payment.order_id,
+            gateway=payment.gateway,
+            account_status=(user.status if user else "—"),
+            salesman=salesman,
+            bill_number=payment.invoice_number,
+            attachments=attachments,
+        )
+
+        notification_service.notify_payment_completed(
+            db,
+            user_name=payment.customer_name or "A user",
+            plan_name=payment.plan_name,
+            amount=amount,
+            payment_id=payment.id,
+        )
+    except Exception:
+        logger.exception("Post-payment follow-ups failed for payment %s", payment.id)
 
 
 # =============================================================================
@@ -194,34 +287,67 @@ def _new_order_id() -> str:
     return f"ITL-{uuid.uuid4().hex[:20].upper()}"
 
 
-def create_paytm_payment(db: Session, user: User, plan_id: str, billing_cycle: str) -> Payment:
-    """Creates a pending Payment row for a checkout attempt. The route then
-    calls paytm_service.initiate_transaction and records the result via
-    record_gateway_init."""
+def create_paytm_payment(db: Session, user: User, plan_id: str, billing_cycle: Optional[str] = None) -> Payment:
+    """Pending Payment for a logged-in customer paying list price (the old /payments/initiate path).
+    The route then calls paytm_service.initiate_transaction and records the result via record_gateway_init."""
 
-    pricing = pricing_service.resolve_plan(db, plan_id, billing_cycle)
+    plan = pricing_service.resolve_plan(db, plan_id)
+    subscription_service.check_purchase_allowed(db, user.id, plan["products"])
+    split = pricing_service.tax_split(plan["base_price"], user.state)
 
     payment = Payment(
         user_id=user.id,
         gateway="paytm",
         status="pending",
         order_id=_new_order_id(),
-        plan_id=pricing["plan_id"],
-        plan_name=pricing["plan_name"],
-        base_price=pricing["base_price"],
-        gst_rate=pricing["gst_rate"],
-        gst_amount=pricing["gst_amount"],
-        payable_amount=pricing["payable_amount"],
-        currency="INR",
-        customer_name=user.name,
-        customer_email=user.email,
-        customer_mobile=user.mobile,
-        customer_gstin=user.gstin,
-        customer_address=_billing_address(user),
-        gateway_response={"billing_cycle": billing_cycle},
+        gateway_response={"billing_cycle": plan["billing_cycle"]},
+        **_price_fields(plan, split, plan["base_price"], None),
+        **_customer_snapshot_from_user(user),
     )
     db.add(payment)
     db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def create_checkout_payment(db: Session, user: User, *, quote: dict, details: dict) -> Payment:
+    """
+    Pending Payment for the public checkout dialog. `quote` comes from
+    checkout_service.build_quote (server-computed); `details` are the customer's
+    (editable) billing details, snapshotted onto the payment for the bill.
+    The coupon use, if any, is reserved in the same transaction.
+    """
+    plan = quote["plan"]
+    payment = Payment(
+        user_id=user.id,
+        gateway="paytm",
+        status="pending",
+        order_id=_new_order_id(),
+        coupon_id=quote["coupon"].id if quote.get("coupon") else None,
+        coupon_code=quote["coupon"].code if quote.get("coupon") else None,
+        salesman_id=quote.get("salesman_id"),
+        price_override_reason=quote.get("reason"),
+        gateway_response={"billing_cycle": plan["billing_cycle"]},
+        customer_name=details["name"],
+        customer_email=user.email,
+        customer_mobile=details["mobile"],
+        customer_gstin=details.get("gstin"),
+        customer_firm=details.get("firm"),
+        customer_address=details["address"],
+        customer_city=details["city"],
+        customer_state=details["state"],
+        customer_pin=details["pin_code"],
+        **_price_fields(plan, quote, quote["list_price"], quote["discount_source"]),
+    )
+    db.add(payment)
+    try:
+        db.flush()
+        if quote.get("coupon"):
+            coupon_service.reserve(db, quote["coupon"].id, user.id, payment, quote["discount_amount"])
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(payment)
     return payment
 
@@ -248,6 +374,7 @@ def mark_init_failed(db: Session, payment: Payment, reason: str, *, raw_response
         "init_error": reason,
         **({"init_error_response": raw_response} if raw_response is not None else {}),
     }
+    coupon_service.release(db, payment)
     db.commit()
     db.refresh(payment)
     return payment
@@ -276,6 +403,7 @@ def mark_init_gateway_error(
         "init_error_status_code": status_code,
         "init_error_body": (body or "")[:2000] or None,
     }
+    coupon_service.release(db, payment)  # the customer's retry creates a fresh order and reserves again
     db.commit()
     db.refresh(payment)
     return payment
@@ -288,47 +416,45 @@ def get_by_order_id(db: Session, order_id: str) -> Payment:
     return payment
 
 
-def _activate_subscription_for_payment(db: Session, payment: Payment, billing_cycle: str) -> Subscription:
-    """Activates a subscription from a successful Paytm payment, using the
-    pricing snapshot already on the Payment row (what the user actually
-    paid) rather than a fresh CMS lookup."""
+def _activate_subscription_for_payment(db: Session, payment: Payment) -> Subscription:
+    """Grants what a successful Paytm payment bought, from the snapshot on the Payment
+    row (what the customer actually paid for) rather than a fresh CMS lookup."""
 
-    start = datetime.utcnow()
-    expiry = start + timedelta(days=subscription_service.CYCLE_DAYS.get(billing_cycle, 30))
-
-    sub = Subscription(
+    term = payment.term_years or 1
+    plan = {
+        "plan_id": payment.plan_id,
+        "plan_name": payment.plan_name,
+        "products": payment.products or product_service.legacy_products_for_plan(payment.plan_id),
+        "term_years": term,
+        "billing_cycle": product_service.cycle_label(term),
+    }
+    amounts = {
+        "base_price": payment.base_price,
+        "gst_rate": payment.gst_rate,
+        "gst_amount": payment.gst_amount,
+        "payable_amount": payment.payable_amount,
+    }
+    return subscription_service.activate_purchase(
+        db,
         user_id=payment.user_id,
-        plan_id=payment.plan_id,
-        plan_name=payment.plan_name,
-        billing_cycle=billing_cycle,
-        base_price=payment.base_price,
-        gst_rate=payment.gst_rate,
-        gst_amount=payment.gst_amount,
-        payable_amount=payment.payable_amount,
-        status="active",
+        plan=plan,
+        amounts=amounts,
         source="online",
-        start_date=start,
-        expiry_date=expiry,
         notes=f"Activated by Paytm payment {payment.order_id}",
     )
-    db.add(sub)
-    db.flush()
-
-    user = db.query(User).filter(User.id == payment.user_id).first()
-    if user:
-        user.plan = sub.plan_name
-
-    return sub
 
 
 def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) -> Payment:
     """
     Called only after a server-to-server call to Paytm's Transaction Status
     API (the sole trustworthy source — see paytm_service module docstring).
-    Marks the Payment success/failed and, on success, activates a
-    Subscription. Idempotent — a payment already marked "success" is
-    returned as-is rather than double-activating a second subscription
+    Marks the Payment success/failed and, on success, activates the purchase,
+    issues the bill and redeems the coupon — all in ONE transaction.
+    Idempotent — a payment already marked "success" is returned as-is
     (Paytm may deliver the callback more than once).
+
+    The amount Paytm says was paid must equal the amount we asked for; otherwise
+    nothing is activated and the payment is flagged for a human to look at.
     """
 
     # Row lock: the Paytm callback, a user recheck and the background
@@ -356,16 +482,34 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
     payment.gateway_txn_id = body.get("txnId") or payment.gateway_txn_id
     payment.gateway_response = {**(payment.gateway_response or {}), "status_response": status_response}
 
+    mismatch_paid = None
     if txn_status == "TXN_SUCCESS":
+        reported = body.get("txnAmount")
+        if reported is not None:
+            try:
+                if abs(Decimal(str(reported)) - Decimal(payment.payable_amount)) > Decimal("0.01"):
+                    mismatch_paid = str(reported)
+            except Exception:
+                mismatch_paid = str(reported)
+
+    outcome = None
+    if txn_status == "TXN_SUCCESS" and mismatch_paid is None:
         payment.status = "success"
         payment.paid_at = datetime.utcnow()
         db.flush()  # allocate payment.id if this is somehow still transient
-        payment.invoice_number = payment.invoice_number or f"INV-{payment.id:06d}"
         payment.receipt_number = payment.receipt_number or f"RCPT-{payment.id:06d}"
 
-        billing_cycle = (payment.gateway_response or {}).get("billing_cycle", "monthly")
-        subscription = _activate_subscription_for_payment(db, payment, billing_cycle)
+        subscription = _activate_subscription_for_payment(db, payment)
         payment.subscription_id = subscription.id
+        coupon_service.mark_redeemed(db, payment)
+
+        # The bill is created in a SAVEPOINT: if it somehow fails, the customer's payment and
+        # activation still stand and an admin can create the bill by hand.
+        try:
+            with db.begin_nested():
+                bill_service.create_for_payment(db, payment)
+        except Exception:
+            logger.exception("Bill creation failed for payment %s — create it manually", payment.id)
 
         log_action(
             db,
@@ -373,10 +517,32 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
             action="payment.paytm_success",
             target_type="payment",
             target_id=payment.id,
-            new_value={"order_id": order_id, "subscription_id": subscription.id},
+            new_value={"order_id": order_id, "subscription_id": subscription.id, "invoice_number": payment.invoice_number},
         )
+        outcome = "success"
+    elif txn_status == "TXN_SUCCESS":
+        payment.status = "failed"
+        payment.gateway_response = {
+            **(payment.gateway_response or {}),
+            "amount_mismatch": {"expected": str(payment.payable_amount), "paytm_reported": mismatch_paid},
+        }
+        coupon_service.release(db, payment)
+        logger.error(
+            "Paytm amount mismatch for order %s: expected %s, Paytm reported %s — NOT activated",
+            order_id, payment.payable_amount, mismatch_paid,
+        )
+        log_action(
+            db,
+            actor_id=payment.user_id,
+            action="payment.amount_mismatch",
+            target_type="payment",
+            target_id=payment.id,
+            new_value={"order_id": order_id, "expected": str(payment.payable_amount), "paytm_reported": mismatch_paid},
+        )
+        outcome = "mismatch"
     elif txn_status == "TXN_FAILURE":
         payment.status = "failed"
+        coupon_service.release(db, payment)
         log_action(
             db,
             actor_id=payment.user_id,
@@ -392,22 +558,15 @@ def finalize_paytm_payment(db: Session, order_id: str, status_response: dict) ->
     db.commit()
     db.refresh(payment)
 
-    if payment.status == "success":
-        if payment.subscription_id:
-            bridge_service.sync_subscription(db, db.get(Subscription, payment.subscription_id))
-        email_service.send_payment_receipt_email(
-            to=payment.customer_email,
-            name=payment.customer_name or "there",
-            plan_name=payment.plan_name,
-            amount=str(payment.payable_amount),
+    if outcome == "success":
+        _after_success(db, payment)
+    elif outcome == "mismatch":
+        email_service.send_payment_mismatch_email(
+            to=PAYMENT_ALERT_EMAIL,
             order_id=payment.order_id,
-        )
-        notification_service.notify_payment_completed(
-            db,
-            user_name=payment.customer_name or "A user",
-            plan_name=payment.plan_name,
-            amount=str(payment.payable_amount),
-            payment_id=payment.id,
+            expected=f"{Decimal(payment.payable_amount):.2f}",
+            paid=mismatch_paid or "?",
+            customer_email=payment.customer_email or "—",
         )
 
     return payment

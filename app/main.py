@@ -16,6 +16,9 @@ from app.models.ai_usage import AIUsageLimit
 from app.models.audit_log import AuditLog
 from app.models.password_reset_otp import PasswordResetOtp
 from app.models.notification import Notification
+from app.models.coupon import Coupon, CouponRedemption
+from app.models.bill import Bill, BillSequence
+from app.models.checkout_otp import CheckoutOtp
 
 # Routes
 from app.routes.auth import router as auth_router
@@ -27,6 +30,9 @@ from app.routes.subscription import router as admin_subscription_router
 from app.routes.payment import router as admin_payment_router
 from app.routes.payment import checkout_router as payment_checkout_router
 from app.routes.notification import router as admin_notification_router
+from app.routes.checkout import router as checkout_router
+from app.routes.admin_coupons import router as admin_coupons_router
+from app.routes.admin_bills import router as admin_bills_router
 from app.routes.admin_logs import router as admin_logs_router
 from app.routes.bridge import router as bridge_router, admin_router as admin_bridge_router
 from app.services import bridge_service, payment_reconcile
@@ -49,6 +55,42 @@ Base.metadata.create_all(bind=engine)
 with engine.begin() as _conn:
     _conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_source VARCHAR(30)")
     _conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_users_signup_source ON users (signup_source)")
+
+    # Products / terms (checkout + bundles). Idempotent; PostgreSQL.
+    for _sql in (
+        "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS products JSONB",
+        "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS term_years INTEGER",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS products JSONB",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS term_years INTEGER",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS list_price NUMERIC(12,2)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12,2)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS discount_source VARCHAR(20)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_id INTEGER REFERENCES coupons(id)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS coupon_code VARCHAR(40)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS salesman_id INTEGER REFERENCES users(id)",
+        "CREATE INDEX IF NOT EXISTS ix_payments_salesman_id ON payments (salesman_id)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS price_override_reason TEXT",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS cgst_amount NUMERIC(12,2)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS sgst_amount NUMERIC(12,2)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS igst_amount NUMERIC(12,2)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_firm VARCHAR(255)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_city VARCHAR(100)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_state VARCHAR(100)",
+        "ALTER TABLE payments ADD COLUMN IF NOT EXISTS customer_pin VARCHAR(20)",
+        # Back-fill rows that pre-date the products column (only touches NULLs, so it is safe to re-run).
+        """UPDATE subscriptions SET products = CASE
+               WHEN plan_id IN ('bundle_yearly', 'bundle_3year', 'bundle_5year') THEN '["itl_ai", "itl_bridge_ai"]'::jsonb
+               WHEN plan_id IN ('bridge_yearly', 'bridge_3year') THEN '["itl_bridge_ai"]'::jsonb
+               ELSE '["itl_ai"]'::jsonb END
+           WHERE products IS NULL""",
+        """UPDATE subscriptions SET term_years = CASE
+               WHEN plan_id IN ('bundle_3year', 'bridge_3year') THEN 3
+               WHEN plan_id = 'bundle_5year' THEN 5
+               ELSE 1 END
+           WHERE term_years IS NULL""",
+        "UPDATE payments SET term_years = 1 WHERE term_years IS NULL",
+    ):
+        _conn.exec_driver_sql(_sql)
 
 app = FastAPI(
     title="ITL AI Backend",
@@ -103,6 +145,9 @@ app.include_router(ai_router)
 app.include_router(admin_subscription_router)
 app.include_router(admin_payment_router)
 app.include_router(payment_checkout_router)
+app.include_router(checkout_router)
+app.include_router(admin_coupons_router)
+app.include_router(admin_bills_router)
 app.include_router(admin_notification_router)
 app.include_router(admin_logs_router)
 app.include_router(bridge_router)

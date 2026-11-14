@@ -31,6 +31,7 @@ from sqlalchemy import (
     ForeignKey,
     Text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.db import Base
@@ -51,6 +52,11 @@ class Subscription(Base):
     plan_id = Column(String(100), nullable=False)  # matches CMS pricingPlans[].id
     plan_name = Column(String(255), nullable=False)
     billing_cycle = Column(String(20), nullable=False, default="monthly")  # monthly | yearly
+
+    # Products this subscription grants: ["itl_ai"] or ["itl_ai", "itl_bridge_ai"].
+    # Snapshot of the plan at purchase time; an admin may override it.
+    products = Column(JSONB, nullable=True)
+    term_years = Column(Integer, nullable=True)  # 1 | 3 | 5
 
     base_price = Column(Numeric(12, 2), nullable=False)
     gst_rate = Column(Numeric(5, 2), nullable=False, default=18.00)

@@ -28,6 +28,7 @@ from urllib.parse import quote
 import httpx
 from jose import jwt
 
+from app.services import products as product_service
 from app.config import (
     BRIDGE_ADMIN_KEY,
     BRIDGE_API_URL,
@@ -39,7 +40,7 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 RETURN_PREFIX = "https://mcp.incometaxlibrary.com/bridge/return"
-BRIDGE_PLAN_CODES = {"bridge_yearly", "bridge_3year", "bundle_yearly", "bundle_3year"}
+BRIDGE_PLAN_CODES = {"bridge_yearly", "bridge_3year", "bundle_yearly", "bundle_3year", "bundle_5year"}
 REQUEST_TIMEOUT = 10.0
 
 
@@ -177,9 +178,28 @@ def get_stats() -> dict:
 
 # ── Subscription sync (payment hooks) ───────────────────────────────────
 
-def resolve_plan_code(plan_id: Optional[str], billing_cycle: Optional[str]) -> Optional[str]:
-    """Maps one of this app's pricing plans to a Bridge plan code, or None
-    when that plan doesn't include ITL Bridge AI."""
+def resolve_plan_code(
+    plan_id: Optional[str],
+    billing_cycle: Optional[str] = None,
+    products: Optional[list] = None,
+    term_years: Optional[int] = None,
+) -> Optional[str]:
+    """Maps a subscription to a Bridge plan code, or None when it doesn't include ITL Bridge AI.
+
+    With `products` (the normal case): the ITL AI + ITL Bridge AI bundle maps to
+    bundle_yearly / bundle_3year / bundle_5year by term. Without them, falls back
+    to the old plan-id / BRIDGE_PLAN_MAP lookup."""
+    if products is not None:
+        if product_service.BRIDGE not in products:
+            return None
+        if product_service.ITL_AI in products:
+            code = product_service.BRIDGE_BUNDLE_CODE_BY_TERM.get(int(term_years or 1))
+            if not code:
+                logger.error("No Bridge bundle plan code for a %s-year term.", term_years)
+            return code
+        # Legacy standalone Bridge plan (no longer sold): keep syncing it as before.
+        return plan_id if plan_id in BRIDGE_PLAN_CODES else None
+
     if not plan_id:
         return None
     if plan_id in BRIDGE_PLAN_CODES:
@@ -191,6 +211,18 @@ def resolve_plan_code(plan_id: Optional[str], billing_cycle: Optional[str]) -> O
         return None
     code = mapping.get(f"{plan_id}:{billing_cycle}") or mapping.get(str(plan_id))
     return code if code in BRIDGE_PLAN_CODES else None
+
+
+def safe_revoke(user_id: int) -> bool:
+    """Removes a customer's Bridge access (e.g. an admin took the Bridge product away). Never raises."""
+    try:
+        if not is_configured():
+            return False
+        revoke(user_key(user_id))
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.error("ITL Bridge AI revoke failed for user %s: %s", user_id, e)
+        return False
 
 
 def bridge_plan_ids() -> list[str]:
@@ -216,7 +248,10 @@ def sync_subscription(db, sub) -> bool:
         if not is_configured() or sub is None:
             return False
 
-        code = resolve_plan_code(sub.plan_id, sub.billing_cycle)
+        code = resolve_plan_code(
+            sub.plan_id, sub.billing_cycle,
+            products=product_service.products_of(sub), term_years=product_service.term_years_of(sub),
+        )
         if not code:
             return False
 
@@ -267,7 +302,10 @@ def resync_all(db) -> dict:
         if sub.user_id in seen:
             continue
         seen.add(sub.user_id)
-        if not resolve_plan_code(sub.plan_id, sub.billing_cycle):
+        if not resolve_plan_code(
+            sub.plan_id, sub.billing_cycle,
+            products=product_service.products_of(sub), term_years=product_service.term_years_of(sub),
+        ):
             skipped += 1
         elif sync_subscription(db, sub):
             sent += 1

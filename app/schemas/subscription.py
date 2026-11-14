@@ -19,7 +19,10 @@ class SubscriptionCreateManual(BaseModel):
 
     user_id: int
     plan_id: str = Field(..., description="Matches a CMS pricingPlans[].id")
-    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
+    # Ignored — the plan defines its term. Kept so older clients still validate.
+    billing_cycle: Optional[str] = None
+    # Product access override (default: what the plan includes). ITL Bridge AI needs ITL AI.
+    products: Optional[list[str]] = None
 
     source: str = Field("manual", regex="^(manual|complimentary)$")
 
@@ -35,7 +38,8 @@ class SubscriptionUpdate(BaseModel):
     """Admin edits to an existing subscription — every field optional/partial."""
 
     plan_id: Optional[str] = None
-    billing_cycle: Optional[str] = Field(None, regex="^(monthly|yearly)$")
+    billing_cycle: Optional[str] = None
+    products: Optional[list[str]] = Field(None, description="Product access: itl_ai | itl_bridge_ai (Bridge needs ITL AI)")
     status: Optional[str] = Field(None, regex="^(pending|active|suspended|cancelled|expired)$")
     start_date: Optional[datetime] = None
     expiry_date: Optional[datetime] = None
@@ -63,6 +67,8 @@ class SubscriptionResponse(BaseModel):
     plan_id: str
     plan_name: str
     billing_cycle: str
+    products: Optional[list[str]] = None
+    term_years: Optional[int] = None
     base_price: Decimal
     gst_rate: Decimal
     gst_amount: Decimal
@@ -86,7 +92,7 @@ class PaymentInitiateRequest(BaseModel):
     """User-initiated checkout — starts a Paytm transaction."""
 
     plan_id: str
-    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
+    billing_cycle: Optional[str] = None  # ignored — the plan defines its term
 
 
 class PaymentInitiateResponse(BaseModel):
@@ -101,8 +107,9 @@ class CashPaymentCreate(BaseModel):
 
     user_id: int
     plan_id: str
-    billing_cycle: str = Field("monthly", regex="^(monthly|yearly)$")
+    billing_cycle: Optional[str] = None  # ignored — the plan defines its term
     override_base_price: Optional[Decimal] = None
+    salesman_id: Optional[int] = None
     payment_notes: Optional[str] = None
 
 
@@ -119,6 +126,13 @@ class PaymentResponse(BaseModel):
     gateway_txn_id: Optional[str]
     plan_id: str
     plan_name: str
+    products: Optional[list[str]] = None
+    term_years: Optional[int] = None
+    list_price: Optional[Decimal] = None
+    discount_amount: Optional[Decimal] = None
+    discount_source: Optional[str] = None
+    coupon_code: Optional[str] = None
+    salesman_id: Optional[int] = None
     base_price: Decimal
     gst_rate: Decimal
     gst_amount: Decimal

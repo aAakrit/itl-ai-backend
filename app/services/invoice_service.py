@@ -30,12 +30,15 @@ SUPPORT_EMAIL = "info@incometaxlibrary.com"
 
 
 def _billing_cycle_label(payment: Payment) -> str:
-    cycle = (payment.gateway_response or {}).get("billing_cycle")
-    if cycle == "yearly":
-        return "One Year Subscription"
-    if cycle == "monthly":
-        return "One Month Subscription"
+    years = payment.term_years or {"yearly": 1, "3year": 3, "5year": 5}.get((payment.gateway_response or {}).get("billing_cycle"))
+    if years:
+        return f"{payment.plan_name} — {'One Year' if years == 1 else f'{years} Year'} Subscription"
     return f"{payment.plan_name} Subscription"
+
+
+def _full_address(payment: Payment) -> str:
+    parts = [payment.customer_address, payment.customer_city, payment.customer_state, payment.customer_pin]
+    return ", ".join(str(p) for p in parts if p) or "—"
 
 
 def _fmt_amount(v) -> str:
@@ -67,7 +70,7 @@ def build_receipt_pdf(payment: Payment) -> bytes:
     elements.append(HRFlowable(width="100%", thickness=1.2, color=brand_color, spaceAfter=8))
     billing_table = Table(
         [
-            [Paragraph(f"<b>Name:</b> {payment.customer_name or '—'}", label_style), Paragraph("<b>Company:</b> —", label_style)],
+            [Paragraph(f"<b>Name:</b> {payment.customer_name or '—'}", label_style), Paragraph(f"<b>Company:</b> {payment.customer_firm or '—'}", label_style)],
             [Paragraph(f"<b>Email:</b> {payment.customer_email or '—'}", label_style), Paragraph(f"<b>Phone:</b> {payment.customer_mobile or '—'}", label_style)],
             [Paragraph(f"<b>GSTIN:</b> {payment.customer_gstin or 'N/A'}", label_style), Paragraph("", label_style)],
         ],
@@ -75,7 +78,7 @@ def build_receipt_pdf(payment: Payment) -> bytes:
     )
     billing_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
     elements.append(billing_table)
-    elements.append(Paragraph(f"<b>Billing Address:</b> {payment.customer_address or '—'}", label_style))
+    elements.append(Paragraph(f"<b>Billing Address:</b> {_full_address(payment)}", label_style))
 
     elements.append(Paragraph("Order Details", section_style))
     elements.append(HRFlowable(width="100%", thickness=1.2, color=brand_color, spaceAfter=8))
@@ -106,7 +109,7 @@ def build_receipt_pdf(payment: Payment) -> bytes:
     elements.append(Spacer(1, 16))
     elements.append(Paragraph(f"We thank you for being a subscriber of {branding.BRAND_SUBTITLE} ({branding.BRAND_WEBSITE}).", footer_style))
     elements.append(Paragraph(f"Your Payment Transaction ID: {payment.gateway_txn_id or '—'}.", footer_style))
-    elements.append(Paragraph("Your subscription is now active." if payment.status == "success" else "Your login will be activated shortly.", footer_style))
+    elements.append(Paragraph("Payment received. Our team will activate your login shortly, if it is not active already." if payment.status == "success" else "Your login will be activated shortly.", footer_style))
     elements.append(Spacer(1, 10))
     elements.append(
         Paragraph(
@@ -153,7 +156,7 @@ def build_receipt_docx(payment: Payment) -> bytes:
             ("Email", payment.customer_email or "—"),
             ("Phone", payment.customer_mobile or "—"),
             ("GSTIN", payment.customer_gstin or "N/A"),
-            ("Billing Address", payment.customer_address or "—"),
+            ("Billing Address", _full_address(payment)),
         ]
     )
     doc.add_paragraph()
@@ -180,7 +183,7 @@ def build_receipt_docx(payment: Payment) -> bytes:
     doc.add_paragraph()
     doc.add_paragraph(f"We thank you for being a subscriber of {branding.BRAND_SUBTITLE} ({branding.BRAND_WEBSITE}).")
     doc.add_paragraph(f"Your Payment Transaction ID: {payment.gateway_txn_id or '—'}.")
-    doc.add_paragraph("Your subscription is now active." if payment.status == "success" else "Your login will be activated shortly.")
+    doc.add_paragraph("Payment received. Our team will activate your login shortly, if it is not active already." if payment.status == "success" else "Your login will be activated shortly.")
     p = doc.add_paragraph()
     r = p.add_run(
         f"Note: If any error occurs, please contact us on {SUPPORT_PHONE_1}, {SUPPORT_PHONE_2} "

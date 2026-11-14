@@ -33,7 +33,15 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 
-def send_email(*, to: str, subject: str, html_body: str, text_body: str | None = None) -> bool:
+def send_email(
+    *,
+    to: str,
+    subject: str,
+    html_body: str,
+    text_body: str | None = None,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> bool:
+    """`attachments` is a list of (filename, bytes, mime-type) — e.g. ("bill.pdf", data, "application/pdf")."""
     if not SMTP_PASSWORD:
         logger.warning("SMTP_PASSWORD not configured — skipping email %r to %s", subject, to)
         return False
@@ -44,6 +52,9 @@ def send_email(*, to: str, subject: str, html_body: str, text_body: str | None =
     msg["To"] = to
     msg.set_content(text_body or _strip_html(html_body))
     msg.add_alternative(html_body, subtype="html")
+    for filename, data, mime in attachments or []:
+        maintype, _, subtype = mime.partition("/")
+        msg.add_attachment(data, maintype=maintype or "application", subtype=subtype or "octet-stream", filename=filename)
 
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
@@ -102,18 +113,100 @@ def send_password_reset_otp_email(*, to: str, otp: str, ttl_minutes: int) -> boo
     )
 
 
-def send_payment_receipt_email(*, to: str, name: str, plan_name: str, amount: str, order_id: str) -> bool:
+def send_payment_receipt_email(
+    *,
+    to: str,
+    name: str,
+    plan_name: str,
+    amount: str,
+    order_id: str,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> bool:
     body = f"""
       <p>Hi {name},</p>
-      <p>We've received your payment for <strong>{plan_name}</strong>. Your subscription is now active.</p>
+      <p>We've received your payment for <strong>{plan_name}</strong>. Thank you!</p>
+      <p>Our team will verify your account and activate your login shortly (if it isn't active already).
+      We'll email you as soon as that's done.</p>
       <table style="width: 100%; border-collapse: collapse; margin-top: 16px;">
         <tr><td style="padding: 6px 0; color: #6b7280;">Order ID</td><td style="padding: 6px 0; text-align: right;">{order_id}</td></tr>
         <tr><td style="padding: 6px 0; color: #6b7280;">Plan</td><td style="padding: 6px 0; text-align: right;">{plan_name}</td></tr>
         <tr><td style="padding: 6px 0; color: #6b7280;">Amount paid</td><td style="padding: 6px 0; text-align: right; font-weight: 600;">₹{amount}</td></tr>
       </table>
+      <p style="margin-top: 16px;">Your GST bill and receipt are attached.</p>
     """
     return send_email(
         to=to,
-        subject="Payment received — receipt",
+        subject="Payment received — bill and receipt",
         html_body=_wrapper("Payment successful", body),
+        attachments=attachments,
     )
+
+
+def send_checkout_otp_email(*, to: str, otp: str, ttl_minutes: int) -> bool:
+    body = f"""
+      <p>Use this code to continue your subscription. It expires in {ttl_minutes} minutes.</p>
+      <p style="font-size: 32px; font-weight: 700; letter-spacing: 0.3em; margin: 20px 0; text-align: center; background: #f3f4f6; padding: 16px; border-radius: 12px;">{otp}</p>
+      <p>If you didn't request this, you can safely ignore this email.</p>
+    """
+    return send_email(
+        to=to,
+        subject=f"Your verification code: {otp}",
+        html_body=_wrapper("Verify your email", body),
+    )
+
+
+def send_payment_alert_email(
+    *,
+    to: str,
+    customer_name: str,
+    customer_email: str,
+    customer_mobile: str | None,
+    plan_name: str,
+    amount: str,
+    order_id: str,
+    gateway: str,
+    account_status: str,
+    salesman: str | None = None,
+    bill_number: str | None = None,
+    attachments: list[tuple[str, bytes, str]] | None = None,
+) -> bool:
+    """Internal alert: a payment was received, the account needs approving."""
+    rows = [
+        ("Customer", customer_name),
+        ("Email", customer_email),
+        ("Mobile", customer_mobile or "—"),
+        ("Plan", plan_name),
+        ("Amount paid (incl. GST)", f"₹{amount}"),
+        ("Payment method", gateway),
+        ("Order ID", order_id),
+        ("Bill no.", bill_number or "—"),
+        ("Salesman", salesman or "—"),
+        ("Account status", account_status),
+    ]
+    table = "".join(
+        f'<tr><td style="padding: 6px 0; color: #6b7280;">{k}</td><td style="padding: 6px 0; text-align: right;">{v}</td></tr>'
+        for k, v in rows
+    )
+    body = f"""
+      <p>A payment has been received. {"Please approve this user in the admin panel." if account_status != "APPROVED" else "The account is already approved."}</p>
+      <table style="width: 100%; border-collapse: collapse; margin-top: 12px;">{table}</table>
+    """
+    return send_email(
+        to=to,
+        subject=f"Payment received — {customer_name} — ₹{amount}",
+        html_body=_wrapper("Payment received", body),
+        attachments=attachments,
+    )
+
+
+def send_payment_mismatch_email(*, to: str, order_id: str, expected: str, paid: str, customer_email: str) -> bool:
+    body = f"""
+      <p>Paytm reported a successful transaction whose amount does not match the order, so <strong>no subscription was activated</strong>. Please review it manually.</p>
+      <table style="width: 100%; border-collapse: collapse; margin-top: 12px;">
+        <tr><td style="padding: 6px 0; color: #6b7280;">Order ID</td><td style="padding: 6px 0; text-align: right;">{order_id}</td></tr>
+        <tr><td style="padding: 6px 0; color: #6b7280;">Customer</td><td style="padding: 6px 0; text-align: right;">{customer_email}</td></tr>
+        <tr><td style="padding: 6px 0; color: #6b7280;">Expected</td><td style="padding: 6px 0; text-align: right;">₹{expected}</td></tr>
+        <tr><td style="padding: 6px 0; color: #6b7280;">Paytm reported</td><td style="padding: 6px 0; text-align: right;">₹{paid}</td></tr>
+      </table>
+    """
+    return send_email(to=to, subject=f"Payment amount mismatch — {order_id}", html_body=_wrapper("Payment needs review", body))

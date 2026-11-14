@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
+from app.models.user import User
+from app.routes.auth import require_admin
 from app.schemas.cms_page import (
     CmsPageCreate,
     CmsPageList,
@@ -33,6 +35,7 @@ def get_page(route: str, db: Session = Depends(get_db)):
 @router.post("/pages", response_model=CmsPageResponse)
 def create_page(
     page: CmsPageCreate,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     return cms_page.create_page(db, page)
@@ -41,6 +44,7 @@ def create_page(
 def update_page(
     route: str,
     page: CmsPageUpdate,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     return cms_page.update_page(db, route, page)
@@ -48,6 +52,7 @@ def update_page(
 @router.delete("/pages/{route}")
 def delete_page(
     route: str,
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     return cms_page.delete_page(db, route)

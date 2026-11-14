@@ -66,6 +66,22 @@ class Payment(Base):
     payable_amount = Column(Numeric(12, 2), nullable=False)
     currency = Column(String(10), nullable=False, default="INR")
 
+    # What was bought (snapshot) and how the price was reached
+    products = Column(JSONB, nullable=True)
+    term_years = Column(Integer, nullable=True)
+    list_price = Column(Numeric(12, 2), nullable=True)       # plan price before any discount
+    discount_amount = Column(Numeric(12, 2), nullable=True)  # list_price - base_price
+    discount_source = Column(String(20), nullable=True)      # coupon | salesman | None
+    coupon_id = Column(Integer, ForeignKey("coupons.id"), nullable=True)
+    coupon_code = Column(String(40), nullable=True)
+    salesman_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    price_override_reason = Column(Text, nullable=True)
+
+    # GST split (base_price is the taxable value; gst_amount = cgst + sgst + igst)
+    cgst_amount = Column(Numeric(12, 2), nullable=True)
+    sgst_amount = Column(Numeric(12, 2), nullable=True)
+    igst_amount = Column(Numeric(12, 2), nullable=True)
+
     # ------------------------------------------------------------------
     # Customer details snapshot (name/GSTIN/address at time of payment —
     # needed on the invoice even if the user later edits their profile)
@@ -75,6 +91,10 @@ class Payment(Base):
     customer_mobile = Column(String(20), nullable=True)
     customer_gstin = Column(String(20), nullable=True)
     customer_address = Column(Text, nullable=True)
+    customer_firm = Column(String(255), nullable=True)
+    customer_city = Column(String(100), nullable=True)
+    customer_state = Column(String(100), nullable=True)
+    customer_pin = Column(String(20), nullable=True)
 
     # ------------------------------------------------------------------
     # Invoice / receipt (numbers allocated on success; PDF generation is

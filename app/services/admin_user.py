@@ -12,6 +12,7 @@ from app.models.subscription import Subscription
 from app.models.user import User
 from app.schemas.admin_user import UserUpdate
 from app.services import bridge_service
+from app.services import products as product_service
 from app.services.audit_service import log_action
 from app.services.auth_utils import hash_password
 
@@ -112,6 +113,8 @@ def _subscription_summary(sub: Optional[Subscription]) -> dict:
         "plan_id": sub.plan_id,
         "plan_name": sub.plan_name,
         "billing_cycle": sub.billing_cycle,
+        "products": product_service.products_of(sub),
+        "term_years": product_service.term_years_of(sub),
         "status": effective_status,
         "source": sub.source,
         "base_price": sub.base_price,
@@ -198,7 +201,7 @@ def _product(user: User, subscription) -> str:
     """'itl_bridge_ai' if the account signed up on the Bridge pages or holds a Bridge plan."""
     if getattr(user, "signup_source", None) == "itl_bridge_ai":
         return "itl_bridge_ai"
-    if subscription is not None and subscription.plan_id in bridge_service.bridge_plan_ids():
+    if subscription is not None and product_service.BRIDGE in product_service.products_of(subscription):
         return "itl_bridge_ai"
     return "itl_ai"
 
@@ -440,7 +443,7 @@ def get_users(
             raise HTTPException(400, "Invalid product. Expected one of: itl_ai, itl_bridge_ai")
         in_bridge = or_(
             func.coalesce(User.signup_source, "") == "itl_bridge_ai",
-            func.coalesce(CurrentSubscription.plan_id, "").in_(bridge_service.bridge_plan_ids()),
+            CurrentSubscription.products.contains([product_service.BRIDGE]),
         )
         query = query.filter(in_bridge if product == "itl_bridge_ai" else ~in_bridge)
 

@@ -78,3 +78,29 @@ BRIDGE_USER_PREFIX = os.getenv("BRIDGE_USER_PREFIX", "in")
 # "<plan_id>:<billing_cycle>" (checked first) or just "<plan_id>". A plan
 # that is not mapped (and is not itself a Bridge plan code) is not synced.
 BRIDGE_PLAN_MAP = os.getenv("BRIDGE_PLAN_MAP", "{}")
+
+
+# ---------------------------------------------------------------------------
+# Billing / checkout
+# ---------------------------------------------------------------------------
+# Seller details printed on every bill (tax invoice / proforma).
+SELLER_NAME = os.getenv("SELLER_NAME", "Income Tax Library")
+SELLER_ADDRESS = os.getenv("SELLER_ADDRESS", "141, Alkapuri Niwaru Road Jhotwara, Jaipur 302012 Rajasthan.")
+SELLER_EMAIL = os.getenv("SELLER_EMAIL", "info@incometaxlibrary.com")
+SELLER_WEBSITE = os.getenv("SELLER_WEBSITE", "www.incometaxlibrary.in")
+SELLER_PHONE = os.getenv("SELLER_PHONE", "09001597011")
+SELLER_GSTIN = os.getenv("SELLER_GSTIN", "08ALNPB6217G1Z7")
+# Customers in this state get CGST + SGST; everyone else gets IGST.
+SELLER_STATE = os.getenv("SELLER_STATE", "Rajasthan")
+# HSN / SAC printed against the subscription line.
+SUBSCRIPTION_HSN = os.getenv("SUBSCRIPTION_HSN", "998439")
+
+# Every successful payment (online or cash) is e-mailed here so the account can be approved.
+PAYMENT_ALERT_EMAIL = os.getenv("PAYMENT_ALERT_EMAIL", "bhaawani.singh@gmail.com")
+
+# A salesman may discount a plan by at most this much on the public checkout.
+# Anything deeper is done by an admin (Admin > Bills / cash payment).
+MAX_SALESMAN_DISCOUNT_PCT = int(os.getenv("MAX_SALESMAN_DISCOUNT_PCT", 50))
+
+CHECKOUT_TOKEN_MINUTES = int(os.getenv("CHECKOUT_TOKEN_MINUTES", 60))
+CHECKOUT_OTP_TTL_MINUTES = int(os.getenv("CHECKOUT_OTP_TTL_MINUTES", 10))
