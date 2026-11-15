@@ -82,6 +82,7 @@ def _subscription_summary(sub: Optional[Subscription]) -> dict:
     if not sub:
         return {
             "id": None,
+            "user_id": None,
             "plan_id": None,
             "plan_name": None,
             "billing_cycle": None,
@@ -110,6 +111,7 @@ def _subscription_summary(sub: Optional[Subscription]) -> dict:
 
     return {
         "id": sub.id,
+        "user_id": sub.user_id,
         "plan_id": sub.plan_id,
         "plan_name": sub.plan_name,
         "billing_cycle": sub.billing_cycle,

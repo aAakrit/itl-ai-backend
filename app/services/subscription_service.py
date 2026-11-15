@@ -49,6 +49,21 @@ def get_latest_for_user(db: Session, user_id: int) -> Optional[Subscription]:
     )
 
 
+def has_bridge_access(db: Session, user_id: int) -> bool:
+    """True while the customer has an active, unexpired subscription that includes ITL Bridge AI."""
+    now = datetime.utcnow()
+    subs = (
+        db.query(Subscription)
+        .filter(
+            Subscription.user_id == user_id,
+            Subscription.status == "active",
+            or_(Subscription.expiry_date.is_(None), Subscription.expiry_date > now),
+        )
+        .all()
+    )
+    return any(product_service.BRIDGE in product_service.products_of(s) for s in subs)
+
+
 def check_purchase_allowed(db: Session, user_id: int, new_products: list[str]) -> None:
     """
     Blocks buying something the customer already has more of: e.g. an ITL AI-only
@@ -280,7 +295,7 @@ def update(db: Session, admin_id: int, subscription_id: int, payload) -> Subscri
     db.commit()
     db.refresh(sub)
     if had_bridge and product_service.BRIDGE not in now_products:
-        bridge_service.safe_revoke(sub.user_id)  # Bridge access was taken away
+        bridge_service.safe_revoke(sub.user_id, db)  # Bridge access was taken away
     bridge_service.sync_subscription(db, sub)
     return sub
 

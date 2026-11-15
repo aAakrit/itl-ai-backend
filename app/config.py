@@ -104,3 +104,14 @@ MAX_SALESMAN_DISCOUNT_PCT = int(os.getenv("MAX_SALESMAN_DISCOUNT_PCT", 50))
 
 CHECKOUT_TOKEN_MINUTES = int(os.getenv("CHECKOUT_TOKEN_MINUTES", 60))
 CHECKOUT_OTP_TTL_MINUTES = int(os.getenv("CHECKOUT_OTP_TTL_MINUTES", 10))
+
+
+# ITL Bridge AI — the Income Tax connector (second MCP server, own host, own subscriptions).
+# It uses the SAME hand-off secret as the GST connector but its OWN admin key.
+BRIDGE_IT_API_URL = os.getenv("BRIDGE_IT_API_URL", "https://mcp-it.incometaxlibrary.com/bridge/api").rstrip("/")
+BRIDGE_IT_ADMIN_KEY = os.getenv("BRIDGE_IT_ADMIN_KEY", "")
+BRIDGE_IT_HANDOFF_SECRET = os.getenv("BRIDGE_IT_HANDOFF_SECRET", "") or BRIDGE_HANDOFF_SECRET
+BRIDGE_IT_RETURN_URL = os.getenv("BRIDGE_IT_RETURN_URL", "https://mcp-it.incometaxlibrary.com/bridge/return")
+# Optional JSON {"bundle_yearly": "<IT plan code>", ...} if the IT server names its plans differently.
+# Anything not listed is sent with the same plan code as the GST connector.
+BRIDGE_IT_PLAN_MAP = os.getenv("BRIDGE_IT_PLAN_MAP", "{}")

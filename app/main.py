@@ -19,6 +19,7 @@ from app.models.notification import Notification
 from app.models.coupon import Coupon, CouponRedemption
 from app.models.bill import Bill, BillSequence
 from app.models.checkout_otp import CheckoutOtp
+from app.models.bridge_connection import BridgeConnection, BridgeConnectorBlock
 
 # Routes
 from app.routes.auth import router as auth_router
@@ -164,5 +165,5 @@ async def start_payment_reconcile():
 async def start_bridge_resync():
     # Nightly safety net for ITL Bridge AI: re-sends every active
     # subscription (idempotent), repairing anything a payment hook missed.
-    if bridge_service.is_configured():
+    if bridge_service.configured_connectors():
         asyncio.create_task(bridge_service.nightly_resync_loop())
