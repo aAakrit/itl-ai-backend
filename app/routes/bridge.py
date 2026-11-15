@@ -54,8 +54,7 @@ def my_status(user: User = Depends(get_current_user), db: Session = Depends(get_
     customer has approved it. Nothing is returned for a customer without an active
     subscription that includes ITL Bridge AI — the section is then hidden.
     """
-    keys = bridge.configured_connectors()
-    if not keys:
+    if not bridge.configured_connectors():
         return {"enabled": False, "has_access": False, "connectors": []}
     if not subscription_service.has_bridge_access(db, user.id):
         return {"enabled": True, "has_access": False, "connectors": []}
@@ -66,42 +65,54 @@ def my_status(user: User = Depends(get_current_user), db: Session = Depends(get_
     }
     uid = bridge.user_key(user.id)
     blocked = bridge.blocked_connectors(db, user.id)
+    sub = subscription_service.get_active_for_user(db, user.id)
+    sync_tried = False
+
+    def entry(key: str, **extra) -> dict:
+        row = approved.get(key)
+        base = {
+            "key": key, "label": bridge.CONNECTORS[key]["label"], "status": None, "links": None,
+            "error": None, "connected": row is not None,
+            "connected_at": row.connected_at if row else None, "disabled": False,
+        }
+        base.update(extra)
+        return base
 
     connectors = []
-    for key in keys:
+    for key in bridge.CONNECTORS:  # always both, GST first
         if key in blocked:
             # Switched off by an admin: no plan details or connect links, just the fact.
-            connectors.append({
-                "key": key, "label": bridge.CONNECTORS[key]["label"], "status": None, "links": None,
-                "error": None, "connected": False, "connected_at": None, "disabled": True,
-            })
+            connectors.append(entry(key, connected=False, connected_at=None, disabled=True))
             continue
-        status = None
-        error = None
-        try:
-            status = bridge.get_status(uid, connector=key)
-        except bridge.BridgeError as e:
-            if e.status == 404:
-                # The connector has no record of this customer yet — same as "no plan".
-                status = {"user_id": uid, "exists": False, "active": False}
-            else:
-                error = e.message
+        if not bridge.is_configured(key):
+            connectors.append(entry(key, error="not_configured"))
+            continue
+
+        def fetch_status():
+            try:
+                return bridge.get_status(uid, connector=key), None
+            except bridge.BridgeError as e:
+                if e.status == 404:
+                    # The connector has no record of this customer yet — same as "no plan".
+                    return {"user_id": uid, "exists": False, "active": False}, None
+                return None, e.message
+
+        status, error = fetch_status()
+
+        # The customer's plan should already be on this server. If it isn't (e.g. the plan was
+        # created before the connector was set up), push it now — once — and look again.
+        if status is not None and not status.get("active") and sub is not None and not sync_tried:
+            sync_tried = True
+            bridge.sync_subscription(db, sub)
+            status, error = fetch_status()
+
         # The Connect buttons are a convenience; a failure here must not hide the plan status.
         try:
             links = bridge.get_connect_links(connector=key)
         except bridge.BridgeError:
             links = None
-        row = approved.get(key)
-        connectors.append({
-            "key": key,
-            "label": bridge.CONNECTORS[key]["label"],
-            "status": status,
-            "links": links,
-            "error": error,
-            "connected": row is not None,
-            "connected_at": row.connected_at if row else None,
-            "disabled": False,
-        })
+        connectors.append(entry(key, status=status, links=links, error=error))
+
     return {"enabled": True, "has_access": True, "connectors": connectors}
 
 
