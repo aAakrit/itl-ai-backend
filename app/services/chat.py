@@ -810,7 +810,7 @@ class ChatService:
 
         message = self.get_owned_message(user_id, message_id)
 
-        if not message or message.message_type != "assistant":
+        if not message or message.message_type not in ("assistant", "refinement"):
             raise LookupError("Message not found.")
 
         if message.feedback:
@@ -857,6 +857,19 @@ class ChatService:
     # Refine
     # ------------------------------------------------------------------
 
+    def _original_query(self, message: AIMessage) -> str:
+        """The user's original question behind an answer, even after several rounds of refining."""
+        current: Optional[AIMessage] = message
+        for _ in range(50):  # a refine chain is short; the cap only guards against a broken parent link
+            if current is None:
+                break
+            if current.message_type == "user":
+                return current.query or ""
+            if current.parent_message_id is None:
+                break
+            current = self.db.query(AIMessage).filter(AIMessage.id == current.parent_message_id).first()
+        return ""
+
     async def refine(
         self,
         user_id: int,
@@ -872,7 +885,7 @@ class ChatService:
 
         message = self.get_owned_message(user_id, message_id)
 
-        if not message or message.message_type != "assistant":
+        if not message or message.message_type not in ("assistant", "refinement"):
             raise LookupError("Message not found.")
 
         conversation = (
@@ -888,19 +901,15 @@ class ChatService:
             provider=message.provider,
         )
 
-        # The original user query this answer was responding to — refine
-        # needs it for context alongside the answer being refined.
-        parent_query = (
-            self.db.query(AIMessage)
-            .filter(AIMessage.id == message.parent_message_id)
-            .first()
-        )
+        # The ORIGINAL question behind this answer. For a first-time refine the parent is the user's
+        # question; for a refine of a refine, walk up past the earlier refine requests until we reach it.
+        original_query = self._original_query(message)
 
         response = await self.call_provider(
             provider=message.provider,
             tool="refine",
             payload={
-                "original_query": parent_query.query if parent_query else "",
+                "original_query": original_query,
                 "original_answer": message.answer or "",
                 "refinement_instructions": instruction,
                 "message_id": message.provider_message_id,
@@ -916,13 +925,27 @@ class ChatService:
         # Vendor's /refine response key is `refined_answer`, not `answer`.
         normalized_response = {**response, "answer": response.get("refined_answer") or response.get("answer")}
 
+        # Keep the instruction in the conversation, as a question in its own right, so the thread
+        # reads: question -> answer -> "Refine: ..." -> refined answer (and survives a reload).
+        # Saved only after the vendor call succeeded, and BEFORE the answer so ids stay in order.
+        refine_request = AIMessage(
+            conversation_id=conversation.id,
+            parent_message_id=message.id,
+            provider=message.provider,
+            message_type="refine_request",
+            status="completed",
+            query=instruction,
+        )
+        self.db.add(refine_request)
+        self.db.flush()
+
         refined_message = self.save_ai_message(
             conversation_id=conversation.id,
             provider=message.provider,
             response=normalized_response,
-            # Chained off the ORIGINAL answer (not its parent question) so the
-            # message tree reflects "this is a refinement of that answer".
-            parent_message_id=message.id,
+            # Chained off the refine request, which is itself chained off the answer being refined,
+            # so any refined answer can be refined again.
+            parent_message_id=refine_request.id,
         )
         refined_message.message_type = "refinement"
 
@@ -1060,7 +1083,7 @@ class ChatService:
         shape regardless of whether it's a user or assistant row.
         """
 
-        is_user = message.message_type == "user"
+        is_user = message.message_type in ("user", "refine_request")
 
         attachment = None
         if message.attachment_path:
@@ -1079,7 +1102,10 @@ class ChatService:
             "role": "user" if is_user else "assistant",
             "message_type": message.message_type,
             "status": message.status,
-            "content": message.query if is_user else message.answer,
+            "content": (
+                f"Refine: {message.query}" if message.message_type == "refine_request"
+                else message.query if is_user else message.answer
+            ),
             "query_time_ms": message.query_time_ms,
             "sources": message.sources,
             "related_judgements": message.related_judgements,
