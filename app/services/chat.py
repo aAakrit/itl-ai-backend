@@ -2,6 +2,7 @@ import logging
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.ai import AIConversation, AIMessage
@@ -964,10 +965,12 @@ class ChatService:
         module: Optional[str] = None,
         tool: Optional[str] = None,
         provider: Optional[str] = None,
+        archived: bool = False,
     ) -> list[AIConversation]:
         """
         Returns non-deleted conversations for a user, most recently active
-        first. When `module`/`tool`/`provider` are given, only conversations
+        first. Archived conversations are left out unless `archived=True`
+        (then ONLY archived ones are returned). When `module`/`tool`/`provider` are given, only conversations
         belonging to that exact workspace are returned — each
         Module+Provider+Tool combination must never see another
         combination's history.
@@ -976,6 +979,7 @@ class ChatService:
         filters = [
             AIConversation.user_id == user_id,
             AIConversation.deleted_at.is_(None),
+            func.coalesce(AIConversation.is_archived, False).is_(archived),
         ]
 
         if module:

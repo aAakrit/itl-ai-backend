@@ -1,9 +1,10 @@
 """
 Product catalogue helpers.
 
-Two sellable products exist: ITL AI and ITL Bridge AI. Bridge is NEVER sold on
-its own — it always comes with ITL AI (the "ITL AI + ITL Bridge AI" bundle).
-A subscription records the products it grants in `Subscription.products`
+Two products exist: ITL AI (the web workspace) and ITL Bridge AI (the GST AI / Income Tax AI
+connectors for Claude, ChatGPT and Gemini). They are independent: a plan can grant either or
+both. The "bundle" plans (bundle_yearly / bundle_3year / bundle_5year) are now ITL Bridge AI only —
+they do NOT include the ITL AI workspace. A subscription records the products it grants in `Subscription.products`
 (a snapshot taken from the plan, which an admin may override).
 
 Rows created before this column existed are read through `products_of`, which
@@ -41,11 +42,8 @@ def normalize(products: Optional[Iterable[str]]) -> list[str]:
 
 
 def validate_sellable(products: Optional[Iterable[str]]) -> list[str]:
-    """normalize + the 'Bridge is never standalone' rule. Use for any NEW grant."""
-    ordered = normalize(products)
-    if BRIDGE in ordered and ITL_AI not in ordered:
-        raise HTTPException(400, "ITL Bridge AI is only available together with ITL AI.")
-    return ordered
+    """normalize() for any NEW grant. Every combination of the two products is allowed."""
+    return normalize(products)
 
 
 def label(products: Iterable[str]) -> str:

@@ -257,13 +257,14 @@ def resolve_plan_code(
     if products is not None:
         if product_service.BRIDGE not in products:
             return None
-        if product_service.ITL_AI in products:
-            code = product_service.BRIDGE_BUNDLE_CODE_BY_TERM.get(int(term_years or 1))
-            if not code:
-                logger.error("No Bridge bundle plan code for a %s-year term.", term_years)
-            return code
-        # Legacy standalone Bridge plan (no longer sold): keep syncing it as before.
-        return plan_id if plan_id in BRIDGE_PLAN_CODES else None
+        # Older standalone Bridge plans keep their own codes.
+        if plan_id in product_service.LEGACY_STANDALONE_BRIDGE_IDS:
+            return plan_id
+        # Everything else (Bridge-only plans, and the older ITL AI + Bridge bundle) maps by term.
+        code = product_service.BRIDGE_BUNDLE_CODE_BY_TERM.get(int(term_years or 1))
+        if not code:
+            logger.error("No Bridge plan code for a %s-year term.", term_years)
+        return code
 
     if not plan_id:
         return None

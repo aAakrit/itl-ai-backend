@@ -14,6 +14,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from app.models.user import User
+from app.routes.access import require_workspace_access
 from app.routes.auth import get_current_user, require_admin
 from app.services.chat import ChatService, NoticeStageError, NoticeUnavailableError
 from app.utils.chat import get_chat_service
@@ -56,6 +57,8 @@ from app.utils.response import success_response
 router = APIRouter(
     prefix="/ai",
     tags=["AI"],
+    # The whole workspace API: admins, staff and customers whose plan includes ITL AI only.
+    dependencies=[Depends(require_workspace_access)],
 )
 
 logger = logging.getLogger(__name__)
@@ -316,10 +319,11 @@ async def list_conversations(
     module: str | None = None,
     tool: str | None = None,
     provider: str | None = None,
+    archived: bool = False,
     chat: ChatService = Depends(get_chat_service),
     current_user: User = Depends(get_current_user),
 ):
-    conversations = chat.list_conversations(current_user.id, module=module, tool=tool, provider=provider)
+    conversations = chat.list_conversations(current_user.id, module=module, tool=tool, provider=provider, archived=archived)
 
     return success_response(
         data=[chat.serialize_conversation(c) for c in conversations],

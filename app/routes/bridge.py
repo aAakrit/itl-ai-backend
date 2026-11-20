@@ -26,6 +26,7 @@ from app.models.user import User
 from app.routes.auth import get_current_user, get_db, require_admin
 from app.services import bridge_service as bridge
 from app.services import subscription_service
+from app.services import products as product_service
 from app.services.audit_service import log_action
 
 router = APIRouter(prefix="/bridge", tags=["ITL Bridge AI"])
@@ -46,6 +47,26 @@ def _call(fn, *args, **kwargs):
 # User-facing
 # =============================================================================
 
+def _plan_summary(sub) -> Optional[dict]:
+    """The customer's ITL Bridge AI plan as the website knows it (not from the MCP server)."""
+    if sub is None:
+        return None
+    now = datetime.utcnow()
+    status = sub.status
+    if status == "active" and sub.expiry_date and sub.expiry_date <= now:
+        status = "expired"
+    days_left = max((sub.expiry_date - now).days, 0) if status == "active" and sub.expiry_date else None
+    return {
+        "plan_name": sub.plan_name,
+        "products": product_service.products_of(sub),
+        "term_years": product_service.term_years_of(sub),
+        "status": status,
+        "start_date": sub.start_date,
+        "expiry_date": sub.expiry_date,
+        "days_left": days_left,
+    }
+
+
 @router.get("/status")
 def my_status(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -55,9 +76,13 @@ def my_status(user: User = Depends(get_current_user), db: Session = Depends(get_
     subscription that includes ITL Bridge AI — the section is then hidden.
     """
     if not bridge.configured_connectors():
-        return {"enabled": False, "has_access": False, "connectors": []}
+        return {"enabled": False, "has_access": False, "subscription": None, "connectors": []}
+
+    plan = _plan_summary(subscription_service.latest_bridge_subscription(db, user.id))
     if not subscription_service.has_bridge_access(db, user.id):
-        return {"enabled": True, "has_access": False, "connectors": []}
+        # Suspended / expired / cancelled: no connectors, but the customer still sees their plan
+        # (and a Renew button). `subscription` is null only if they never had ITL Bridge AI.
+        return {"enabled": True, "has_access": False, "subscription": plan, "connectors": []}
 
     approved = {
         c.connector: c
@@ -113,7 +138,7 @@ def my_status(user: User = Depends(get_current_user), db: Session = Depends(get_
             links = None
         connectors.append(entry(key, status=status, links=links, error=error))
 
-    return {"enabled": True, "has_access": True, "connectors": connectors}
+    return {"enabled": True, "has_access": True, "subscription": plan, "connectors": connectors}
 
 
 class AllowDecision(BaseModel):

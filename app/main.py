@@ -32,6 +32,7 @@ from app.routes.payment import router as admin_payment_router
 from app.routes.payment import checkout_router as payment_checkout_router
 from app.routes.notification import router as admin_notification_router
 from app.routes.checkout import router as checkout_router
+from app.routes.access import router as access_router
 from app.routes.admin_coupons import router as admin_coupons_router
 from app.routes.admin_bills import router as admin_bills_router
 from app.routes.admin_logs import router as admin_logs_router
@@ -147,6 +148,7 @@ app.include_router(admin_subscription_router)
 app.include_router(admin_payment_router)
 app.include_router(payment_checkout_router)
 app.include_router(checkout_router)
+app.include_router(access_router)
 app.include_router(admin_coupons_router)
 app.include_router(admin_bills_router)
 app.include_router(admin_notification_router)

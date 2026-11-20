@@ -49,6 +49,21 @@ def get_latest_for_user(db: Session, user_id: int) -> Optional[Subscription]:
     )
 
 
+def has_itl_ai_access(db: Session, user_id: int) -> bool:
+    """True while the customer has an active, unexpired subscription that includes ITL AI (the workspace)."""
+    now = datetime.utcnow()
+    subs = (
+        db.query(Subscription)
+        .filter(
+            Subscription.user_id == user_id,
+            Subscription.status == "active",
+            or_(Subscription.expiry_date.is_(None), Subscription.expiry_date > now),
+        )
+        .all()
+    )
+    return any(product_service.ITL_AI in product_service.products_of(s) for s in subs)
+
+
 def has_bridge_access(db: Session, user_id: int) -> bool:
     """True while the customer has an active, unexpired subscription that includes ITL Bridge AI."""
     now = datetime.utcnow()
@@ -62,6 +77,19 @@ def has_bridge_access(db: Session, user_id: int) -> bool:
         .all()
     )
     return any(product_service.BRIDGE in product_service.products_of(s) for s in subs)
+
+
+def latest_bridge_subscription(db: Session, user_id: int) -> Optional[Subscription]:
+    """The customer's most relevant subscription that includes ITL Bridge AI: a live one if there
+    is one, otherwise the most recent (suspended / expired / cancelled) — so the account page can
+    still show it and offer a renewal."""
+    now = datetime.utcnow()
+    subs = db.query(Subscription).filter(Subscription.user_id == user_id).order_by(Subscription.id.desc()).all()
+    with_bridge = [s for s in subs if product_service.BRIDGE in product_service.products_of(s)]
+    for s in with_bridge:
+        if s.status == "active" and (s.expiry_date is None or s.expiry_date > now):
+            return s
+    return with_bridge[0] if with_bridge else None
 
 
 def check_purchase_allowed(db: Session, user_id: int, new_products: list[str]) -> None:
