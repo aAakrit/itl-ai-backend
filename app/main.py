@@ -1,3 +1,4 @@
+import logging
 import asyncio
 
 from fastapi import FastAPI
@@ -93,6 +94,25 @@ with engine.begin() as _conn:
         "UPDATE payments SET term_years = 1 WHERE term_years IS NULL",
     ):
         _conn.exec_driver_sql(_sql)
+
+# Emails are case-insensitive. Lower-case existing addresses where that can't collide with another
+# account, then enforce uniqueness on lower(email). If two accounts already differ only by case the
+# index can't be created — it's logged, and those duplicates need merging by hand (see CHANGES notes).
+try:
+    with engine.begin() as _conn:
+        _conn.exec_driver_sql(
+            "UPDATE users SET email = lower(email) WHERE email <> lower(email) AND NOT EXISTS "
+            "(SELECT 1 FROM users u2 WHERE lower(u2.email) = lower(users.email) AND u2.id <> users.id)"
+        )
+except Exception as _e:  # noqa: BLE001
+    logging.getLogger(__name__).warning("Couldn't lower-case existing emails: %s", _e)
+try:
+    with engine.begin() as _conn:
+        _conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email_lower ON users (lower(email))")
+except Exception as _e:  # noqa: BLE001
+    logging.getLogger(__name__).warning(
+        "Unique index on lower(email) NOT created — duplicate accounts differing only by case exist: %s", _e
+    )
 
 app = FastAPI(
     title="ITL AI Backend",

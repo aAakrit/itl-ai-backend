@@ -4,6 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
@@ -41,10 +42,20 @@ def get_db():
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
+
+def _norm_email(email: str) -> str:
+    """Emails are case-insensitive: Foo@Gmail.com and foo@gmail.com are the same account."""
+    return (email or "").strip().lower()
+
+
+def _user_by_email(db: Session, email: str):
+    return db.query(User).filter(func.lower(User.email) == _norm_email(email)).first()
+
+
 @router.post("/register")
 def register(user: UserRegister, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
 
-    existing = db.query(User).filter(User.email == user.email).first()
+    existing = _user_by_email(db, user.email)
 
     if existing:
         raise HTTPException(
@@ -53,7 +64,7 @@ def register(user: UserRegister, background_tasks: BackgroundTasks, db: Session 
         )
 
     new_user = User(
-        email=user.email,
+        email=_norm_email(user.email),
         password=hash_password(user.password),
 
         name=user.name,
@@ -96,11 +107,7 @@ def login(
     db: Session = Depends(get_db),
 ):
 
-    db_user = (
-        db.query(User)
-        .filter(User.email == user.email)
-        .first()
-    )
+    db_user = _user_by_email(db, user.email)
 
     if not db_user:
         raise HTTPException(
@@ -346,7 +353,7 @@ def _latest_valid_otp(db: Session, email: str) -> "PasswordResetOtp | None":
     return (
         db.query(PasswordResetOtp)
         .filter(
-            PasswordResetOtp.email == email,
+            func.lower(PasswordResetOtp.email) == _norm_email(email),
             PasswordResetOtp.consumed_at.is_(None),
             PasswordResetOtp.expires_at > datetime.utcnow(),
         )
@@ -361,7 +368,7 @@ def request_password_otp(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
-    user = db.query(User).filter(User.email == payload.email).first()
+    user = _user_by_email(db, payload.email)
 
     # Always the same response whether or not the account exists — the
     # point of the generic message is to not leak which emails are
@@ -421,7 +428,7 @@ def reset_password(payload: PasswordResetSubmit, db: Session = Depends(get_db)):
             db.commit()
         raise HTTPException(status_code=400, detail="Invalid or expired code — please request a new one.")
 
-    user = db.query(User).filter(User.email == payload.email).first()
+    user = _user_by_email(db, payload.email)
     if not user:
         raise HTTPException(status_code=404, detail="Account not found.")
 
